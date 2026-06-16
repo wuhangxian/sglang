@@ -325,11 +325,20 @@ impl CacheAwarePolicy {
             );
         }
 
-        // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
+        // Use shortest queue when imbalanced. If multiple workers have the
+        // same load, randomize among them to avoid always picking index 0.
+        let min_load = healthy_indices
             .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
+            .map(|&idx| workers[idx].load())
+            .min()
+            .unwrap_or(0);
+        let min_load_workers: Vec<usize> = healthy_indices
+            .iter()
+            .filter(|&&idx| workers[idx].load() == min_load)
+            .copied()
+            .collect();
+        let mut rng = rand::rng();
+        let min_load_idx = min_load_workers[rng.random_range(0..min_load_workers.len())];
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -438,11 +447,32 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use worker with minimum load
-                healthy_indices
+                // Low cache match: use worker with minimum load. If there is
+                // already partial affinity and that worker is also minimally
+                // loaded, keep it to avoid breaking PD cache locality; only
+                // randomize true ties with no usable affinity.
+                let min_load = healthy_indices
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
+                    .map(|&idx| workers[idx].load())
+                    .min()
+                    .unwrap_or(0);
+                let min_load_workers: Vec<usize> = healthy_indices
+                    .iter()
+                    .filter(|&&idx| workers[idx].load() == min_load)
                     .copied()
+                    .collect();
+                let tenant_idx = (result.matched_char_count > 0)
+                    .then(|| {
+                        workers
+                            .iter()
+                            .position(|w| w.url() == result.tenant.as_ref())
+                            .filter(|idx| min_load_workers.contains(idx))
+                    })
+                    .flatten();
+                tenant_idx.or_else(|| {
+                    let mut rng = rand::rng();
+                    Some(min_load_workers[rng.random_range(0..min_load_workers.len())])
+                })
             };
 
             if let Some(idx) = selected_idx {
@@ -464,6 +494,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
                 // Increment processed counter
                 workers[idx].increment_processed();
+
+                debug!(
+                    "Cache-aware selected worker {} (match_rate={:.2}, load={})",
+                    workers[idx].url(),
+                    match_rate,
+                    workers[idx].load()
+                );
 
                 return Some(idx);
             }

@@ -446,8 +446,8 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        guards: Vec<WorkerLoadGuard>,
     ) -> Response {
         let status = res.status();
 
@@ -490,8 +490,8 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(response_headers),
-                prefill,
                 decode,
+                guards,
             )
         } else {
             // Handle non-streaming error response
@@ -575,12 +575,12 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        // Create load guards before dispatch so PD cache-aware routing can observe
+        // in-flight work as soon as the request is sent to prefill/decode workers.
+        let guards = vec![
+            WorkerLoadGuard::new(prefill.clone(), headers),
+            WorkerLoadGuard::new(decode.clone(), headers),
+        ];
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -660,7 +660,7 @@ impl PDRouter {
                     }
 
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, decode, guards)
                         .await;
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
@@ -711,8 +711,8 @@ impl PDRouter {
                         prefill_logprobs,
                         context.return_logprob,
                         Some(response_headers),
-                        prefill,
                         decode,
+                        guards,
                     )
                 } else {
                     // Non-streaming response
@@ -929,8 +929,8 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        guards: Vec<WorkerLoadGuard>,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1018,11 +1018,6 @@ impl PDRouter {
 
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
-
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
@@ -1686,8 +1681,11 @@ mod tests {
                 None,
                 false,
                 None,
-                prefill_ref.clone(),
                 decode_ref.clone(),
+                vec![
+                    WorkerLoadGuard::new(prefill_ref.clone(), None),
+                    WorkerLoadGuard::new(decode_ref.clone(), None),
+                ],
             );
 
             // Guards are now attached to response body, so load should be 1

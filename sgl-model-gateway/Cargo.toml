@@ -79,6 +79,7 @@ reasoning-parser = "=1.0.0"
 openai-protocol = { version = "=1.0.0", features = ["axum"] }
 tool-parser = "=1.0.0"
 llm-tokenizer = "=1.3.2"
+tokenizers = "0.22.0"
 smg-auth = "=1.0.0"
 wfaas = "=1.0.0"
 data-connector = "=1.0.0"
@@ -122,6 +123,9 @@ redis = { version = "0.27.6", features = ["tokio-comp", "json", "connection-mana
 
 # wasm dependencies
 sha2 = "0.10"
+rmp-serde = "1"
+tokio-util = "0.7"
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 wasmtime = { version = "38.0", features = ["component-model", "async"] }
 
 [build-dependencies]
@@ -130,6 +134,7 @@ toml = "0.9"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+rmp = "0.8"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 portpicker = "0.1"

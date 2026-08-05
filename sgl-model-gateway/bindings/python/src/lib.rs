@@ -378,6 +378,7 @@ struct Router {
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
+    enable_prefill_p2p_kv_transfer: bool,
     bucket_adjust_interval_secs: usize,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
@@ -591,6 +592,7 @@ impl Router {
             .connection_mode(self.connection_mode.clone())
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
+            .prefill_p2p_kv_transfer(self.enable_prefill_p2p_kv_transfer)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .max_concurrent_requests(self.max_concurrent_requests)
@@ -701,6 +703,7 @@ impl Router {
         shutdown_grace_period_secs = 180,
         request_id_headers = None,
         pd_disaggregation = false,
+        enable_prefill_p2p_kv_transfer = false,
         bucket_adjust_interval_secs = 5,
         prefill_urls = None,
         decode_urls = None,
@@ -793,6 +796,7 @@ impl Router {
         shutdown_grace_period_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
+        enable_prefill_p2p_kv_transfer: bool,
         bucket_adjust_interval_secs: usize,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
@@ -898,6 +902,7 @@ impl Router {
             shutdown_grace_period_secs,
             request_id_headers,
             pd_disaggregation,
+            enable_prefill_p2p_kv_transfer,
             bucket_adjust_interval_secs,
             prefill_urls,
             decode_urls,

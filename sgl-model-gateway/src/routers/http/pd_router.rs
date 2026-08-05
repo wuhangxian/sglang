@@ -1,4 +1,13 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    fmt,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -12,12 +21,17 @@ use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::time::Instant as TokioInstant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
-use super::pd_types::api_path;
+use super::{
+    p2p_node_gate::{P2pAdmissionResult, P2pFreshPlan, P2pNodeGate, P2pNodeLease},
+    pd_types::api_path,
+};
 use crate::{
-    config::types::RetryConfig,
+    config::{types::RetryConfig, PolicyConfig},
     core::{
         is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
         WorkerType, UNKNOWN_MODEL_ID,
@@ -27,7 +41,10 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{
+        LoadBalancingPolicy, P2pCacheAwareSelector, P2pPreparedRequest, P2pRoutingConfig,
+        PolicyRegistry, RemoteKvDecision, SelectWorkerInfo,
+    },
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         classify::ClassifyRequest,
@@ -39,14 +56,17 @@ use crate::{
     },
     routers::{
         error,
-        grpc::utils::{error_type_from_status, route_to_endpoint},
+        grpc::utils::{
+            error_type_from_status, filter_chat_request_by_tool_choice, process_chat_messages,
+            route_to_endpoint,
+        },
         header_utils,
         streaming_utils::BreakerTrackedStream,
         RouterTrait,
     },
+    tokenizer::TokenizerRegistry,
 };
 
-#[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -54,6 +74,19 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    tokenizer_registry: Arc<TokenizerRegistry>,
+    p2p_untruncated_tokenizer: Option<P2pUntruncatedTokenizer>,
+    p2p_selector: Option<Arc<P2pCacheAwareSelector>>,
+    p2p_node_gate: Option<P2pNodeGate>,
+}
+
+impl fmt::Debug for PDRouter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PDRouter")
+            .field("enable_igw", &self.enable_igw)
+            .field("p2p_enabled", &self.p2p_selector.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]
@@ -63,8 +96,80 @@ struct PDRequestContext<'a> {
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<String>,
+    request_tokens: Option<Vec<u32>>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+}
+
+#[derive(Clone)]
+struct P2pUntruncatedTokenizer {
+    source: String,
+    tokenizer: Arc<tokenizers::Tokenizer>,
+}
+
+#[derive(Clone, Serialize)]
+struct ForwardedChatRequest<'a> {
+    #[serde(flatten)]
+    request: &'a ChatCompletionRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_ids: Option<&'a [u32]>,
+}
+
+struct SelectedPdPair {
+    prefill: Arc<dyn Worker>,
+    decode: Arc<dyn Worker>,
+    remote_kv: Option<RemoteKvDecision>,
+    prepared_p2p_request: Option<P2pPreparedRequest>,
+}
+
+const P2P_NODE_LOCK_REPLAN_INTERVAL: Duration = Duration::from_secs(1);
+const P2P_NODE_LOCK_ADMISSION_BUDGET: Duration = Duration::from_secs(120);
+const P2P_NODE_LOCK_MAX_REPLANS: usize = 120;
+
+struct P2pTransferLease {
+    _node_lease: P2pNodeLease,
+    explicitly_settled: bool,
+    acquired_at: Instant,
+    source_url: String,
+    target_url: String,
+    matched_tokens: usize,
+    attempt_id: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum P2pTransferOutcome {
+    Transferred { transferred_tokens: usize },
+    Fallback,
+    TransportUncertain,
+}
+
+impl P2pTransferLease {
+    fn release(mut self, reason: &'static str) {
+        self.explicitly_settled = true;
+        info!(
+            attempt_id = %self.attempt_id,
+            source = %self.source_url,
+            target = %self.target_url,
+            matched_tokens = self.matched_tokens,
+            held_ms = self.acquired_at.elapsed().as_millis() as u64,
+            reason,
+            "P2P source and target node locks released"
+        );
+    }
+}
+
+impl Drop for P2pTransferLease {
+    fn drop(&mut self) {
+        if !self.explicitly_settled {
+            error!(
+                attempt_id = %self.attempt_id,
+                source = %self.source_url,
+                target = %self.target_url,
+                matched_tokens = self.matched_tokens,
+                "P2P transfer lease dropped without explicit settlement; its two node locks are being released defensively"
+            );
+        }
+    }
 }
 
 /// Marker placed on a `Response` by paths inside
@@ -77,6 +182,28 @@ struct PDRequestContext<'a> {
 struct BreakerOutcomesRecorded;
 
 impl PDRouter {
+    fn load_p2p_untruncated_tokenizer(
+        source: &str,
+    ) -> Result<(tokenizers::Tokenizer, Option<usize>), String> {
+        let source_path = Path::new(source);
+        let tokenizer_path = if source_path.is_dir() {
+            source_path.join("tokenizer.json")
+        } else {
+            source_path.to_path_buf()
+        };
+        let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|error| {
+            format!(
+                "failed to load P2P tokenizer {}: {error}",
+                tokenizer_path.display()
+            )
+        })?;
+        let previous_max_length = tokenizer.get_truncation().map(|params| params.max_length);
+        tokenizer
+            .with_truncation(None)
+            .map_err(|error| format!("failed to disable P2P tokenizer truncation: {error}"))?;
+        Ok((tokenizer, previous_max_length))
+    }
+
     async fn proxy_to_first_prefill_worker(
         &self,
         endpoint: &str,
@@ -169,6 +296,68 @@ impl PDRouter {
     }
 
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+        let p2p_selector = ctx.kv_event_index.as_ref().and_then(|index| {
+            match ctx
+                .router_config
+                .mode
+                .get_prefill_policy(&ctx.router_config.policy)
+            {
+                PolicyConfig::CacheAware {
+                    cache_threshold,
+                    balance_abs_threshold,
+                    balance_rel_threshold,
+                    ..
+                } => Some(Arc::new(P2pCacheAwareSelector::new(
+                    P2pRoutingConfig {
+                        cache_threshold: *cache_threshold,
+                        balance_abs_threshold: *balance_abs_threshold,
+                        balance_rel_threshold: *balance_rel_threshold,
+                    },
+                    index.tree(),
+                    index.block_size_oracle(),
+                ))),
+                policy => {
+                    warn!(
+                        ?policy,
+                        "Prefill P2P requires cache_aware Prefill policy; using legacy routing"
+                    );
+                    None
+                }
+            }
+        });
+
+        let p2p_untruncated_tokenizer = p2p_selector.as_ref().and_then(|_| {
+            let source = ctx
+                .router_config
+                .tokenizer_path
+                .as_ref()
+                .or(ctx.router_config.model_path.as_ref())?;
+            match Self::load_p2p_untruncated_tokenizer(source) {
+                Ok((tokenizer, previous_max_length)) => {
+                    info!(
+                        model = source,
+                        ?previous_max_length,
+                        "Loaded untruncated tokenizer for P2P prefix routing"
+                    );
+                    Some(P2pUntruncatedTokenizer {
+                        source: source.clone(),
+                        tokenizer: Arc::new(tokenizer),
+                    })
+                }
+                Err(error) => {
+                    warn!(
+                        model = source,
+                        %error,
+                        "Unable to load untruncated P2P tokenizer; using registered tokenizer fallback"
+                    );
+                    None
+                }
+            }
+        });
+        let p2p_node_gate = p2p_selector
+            .as_ref()
+            .map(|_| P2pNodeGate::new(P2P_NODE_LOCK_REPLAN_INTERVAL, P2P_NODE_LOCK_MAX_REPLANS));
+
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -176,6 +365,10 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            tokenizer_registry: Arc::clone(&ctx.tokenizer_registry),
+            p2p_untruncated_tokenizer,
+            p2p_selector,
+            p2p_node_gate,
         })
     }
 
@@ -187,7 +380,7 @@ impl PDRouter {
         )
     }
 
-    fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
+    fn handle_serialization_error(error: impl fmt::Display) -> Response {
         error!("Failed to serialize request error={}", error);
         error::internal_error("serialization_failed", "Failed to serialize request")
     }
@@ -220,10 +413,405 @@ impl PDRouter {
         None
     }
 
+    fn p2p_tokens_from_input_ids(input_ids: &InputIds) -> Option<Vec<u32>> {
+        let ids = match input_ids {
+            InputIds::Single(ids) => ids.as_slice(),
+            InputIds::Batch(batches) if batches.len() == 1 => batches[0].as_slice(),
+            InputIds::Batch(_) => return None,
+        };
+        ids.iter()
+            .map(|&id| u32::try_from(id))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()
+    }
+
+    fn resolve_p2p_tokenizer_model_id<'a>(
+        &self,
+        requested_model: Option<&'a str>,
+    ) -> Option<Cow<'a, str>> {
+        let requested_model = requested_model?;
+        if self.tokenizer_registry.get(requested_model).is_some() {
+            return Some(Cow::Borrowed(requested_model));
+        }
+        if self.enable_igw {
+            warn!(
+                requested_model,
+                "p2p_tokenizer_missing: IGW requires an exact tokenizer model match"
+            );
+            return None;
+        }
+
+        let mut resolved_model: Option<String> = None;
+        for worker in self.worker_registry.get_prefill_workers() {
+            let worker_model = worker.model_id();
+            if worker_model == UNKNOWN_MODEL_ID
+                || self.tokenizer_registry.get(worker_model).is_none()
+            {
+                continue;
+            }
+            match resolved_model.as_deref() {
+                None => resolved_model = Some(worker_model.to_string()),
+                Some(existing) if existing == worker_model => {}
+                Some(existing) => {
+                    warn!(
+                        requested_model,
+                        first_tokenizer_model = existing,
+                        conflicting_tokenizer_model = worker_model,
+                        "p2p_tokenizer_alias_ambiguous"
+                    );
+                    return None;
+                }
+            }
+        }
+        resolved_model.map(Cow::Owned)
+    }
+
+    fn p2p_untruncated_tokenizer_for_model(
+        &self,
+        model_id: &str,
+    ) -> Option<&tokenizers::Tokenizer> {
+        let untruncated = self.p2p_untruncated_tokenizer.as_ref()?;
+        if !self.enable_igw {
+            return Some(untruncated.tokenizer.as_ref());
+        }
+
+        let entry = self
+            .tokenizer_registry
+            .get_by_name(model_id)
+            .or_else(|| self.tokenizer_registry.get_by_id(model_id))?;
+        (entry.source == untruncated.source).then_some(untruncated.tokenizer.as_ref())
+    }
+
+    fn encode_p2p_text(&self, model_id: Option<&str>, text: &str) -> Option<Vec<u32>> {
+        let model_id = self.resolve_p2p_tokenizer_model_id(model_id)?;
+        if let Some(tokenizer) = self.p2p_untruncated_tokenizer_for_model(model_id.as_ref()) {
+            return tokenizer
+                .encode(text, false)
+                .map(|encoding| encoding.get_ids().to_vec())
+                .map_err(|error| {
+                    debug!(model = %model_id, %error, "Untruncated P2P tokenization failed");
+                    error
+                })
+                .ok();
+        }
+        let tokenizer = self.tokenizer_registry.get(model_id.as_ref())?;
+        tokenizer
+            .encode(text, false)
+            .map(|encoding| encoding.token_ids().to_vec())
+            .map_err(|err| {
+                debug!(model = %model_id, error = %err, "P2P tokenization failed");
+                err
+            })
+            .ok()
+    }
+
+    fn p2p_tokens_for_generate(
+        &self,
+        request: &GenerateRequest,
+        model_id: Option<&str>,
+    ) -> Option<Vec<u32>> {
+        if let Some(input_ids) = request.input_ids.as_ref() {
+            return Self::p2p_tokens_from_input_ids(input_ids);
+        }
+        self.encode_p2p_text(model_id, request.text.as_deref()?)
+    }
+
+    fn p2p_tokens_for_chat(
+        &self,
+        request: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        input_ids: Option<&[u32]>,
+    ) -> Option<Vec<u32>> {
+        if let Some(input_ids) = input_ids {
+            info!(
+                token_source = "upstream",
+                token_count = input_ids.len(),
+                "P2P routing token source selected"
+            );
+            return Some(input_ids.to_vec());
+        }
+
+        let requested_model = model_id.unwrap_or(&request.model);
+        let model_id = self.resolve_p2p_tokenizer_model_id(Some(requested_model))?;
+        let tokenizer = self.tokenizer_registry.get(model_id.as_ref())?;
+        let filtered_request = filter_chat_request_by_tool_choice(request);
+        let processed = process_chat_messages(filtered_request.as_ref(), tokenizer.as_ref())
+            .map_err(|err| {
+                debug!(model = %model_id, error = %err, "P2P chat-template processing failed");
+                err
+            })
+            .ok()?;
+        if let Some(untruncated) = self.p2p_untruncated_tokenizer_for_model(model_id.as_ref()) {
+            return untruncated
+                .encode(processed.text.as_str(), false)
+                .map(|encoding| {
+                    let tokens = encoding.get_ids().to_vec();
+                    info!(
+                        token_source = "local_untruncated",
+                        token_count = tokens.len(),
+                        "P2P routing token source selected"
+                    );
+                    tokens
+                })
+                .map_err(|error| {
+                    debug!(model = %model_id, %error, "Untruncated P2P chat tokenization failed");
+                    error
+                })
+                .ok();
+        }
+        tokenizer
+            .encode(&processed.text, false)
+            .map(|encoding| {
+                let tokens = encoding.token_ids().to_vec();
+                info!(
+                    token_source = "registered_fallback",
+                    token_count = tokens.len(),
+                    "P2P routing token source selected"
+                );
+                tokens
+            })
+            .ok()
+    }
+
+    fn p2p_tokens_for_completion(
+        &self,
+        request: &CompletionRequest,
+        model_id: Option<&str>,
+    ) -> Option<Vec<u32>> {
+        let prompt = match &request.prompt {
+            StringOrArray::String(text) => text.as_str(),
+            StringOrArray::Array(texts) => texts.first()?.as_str(),
+        };
+        self.encode_p2p_text(Some(model_id.unwrap_or(&request.model)), prompt)
+    }
+
     // Static key strings to avoid per-request allocations
     const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
+    const REMOTE_KV_KEYS: [&'static str; 7] = [
+        "remote_kv_source_url",
+        "remote_kv_source_bootstrap_addr",
+        "remote_kv_target_url",
+        "remote_kv_matched_tokens",
+        "remote_kv_token_ids",
+        "remote_kv_reason",
+        "remote_kv_attempt_id",
+    ];
+    const REMOTE_KV_HEADER_KEYS: [&'static str; 6] = [
+        "x-sgl-remote-kv-source",
+        "x-sgl-remote-kv-source-bootstrap-addr",
+        "x-sgl-remote-kv-target",
+        "x-sgl-remote-kv-matched-tokens",
+        "x-sgl-remote-kv-reason",
+        "x-sgl-remote-kv-attempt-id",
+    ];
+    const P2P_CACHE_NAMESPACE_KEYS: [&'static str; 4] =
+        ["extra_key", "cache_salt", "lora_id", "lora_path"];
+
+    fn prepare_pd_headers(inbound: &HeaderMap) -> (HeaderMap, HeaderMap) {
+        let mut clean = inbound.clone();
+        for key in Self::REMOTE_KV_HEADER_KEYS {
+            clean.remove(key);
+        }
+        (clean.clone(), clean)
+    }
+
+    fn prepare_pd_payloads(original: &Value) -> Result<(Value, Value), String> {
+        let mut clean = original.clone();
+        let clean_obj = clean
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+        for key in Self::REMOTE_KV_KEYS {
+            clean_obj.remove(key);
+        }
+
+        Ok((clean.clone(), clean))
+    }
+
+    fn p2p_transfer_payload(decision: &RemoteKvDecision, attempt_id: &str) -> Value {
+        json!({
+            "source_url": decision.source_url,
+            "target_url": decision.target_url,
+            "token_ids": decision.token_ids,
+            "matched_tokens": decision.matched_tokens,
+            "request_id": attempt_id,
+            "dry_run": false,
+            "reason": decision.reason,
+            "source_bootstrap_addr": decision.source_bootstrap_addr,
+        })
+    }
+
+    fn p2p_nonempty_cache_namespace(request: &Value) -> Option<&'static str> {
+        let request = request.as_object()?;
+        Self::P2P_CACHE_NAMESPACE_KEYS
+            .into_iter()
+            .find(|key| match request.get(*key) {
+                None | Some(Value::Null) => false,
+                Some(Value::String(value)) => !value.is_empty(),
+                Some(Value::Array(value)) => !value.is_empty(),
+                Some(Value::Object(value)) => !value.is_empty(),
+                Some(_) => true,
+            })
+    }
+
+    fn p2p_response_endpoint_matches(payload: &Value, field: &str, expected: &str) -> bool {
+        match payload.get(field).and_then(Value::as_str) {
+            None | Some("") => true,
+            Some(actual) => actual.trim_end_matches('/') == expected.trim_end_matches('/'),
+        }
+    }
+
+    async fn execute_independent_p2p_transfer(
+        &self,
+        headers: &HeaderMap,
+        decision: &RemoteKvDecision,
+        lease: P2pTransferLease,
+    ) -> P2pTransferOutcome {
+        let payload = Self::p2p_transfer_payload(decision, &lease.attempt_id);
+        let target_endpoint = decision.target_url.trim_end_matches('/');
+        let request = self.build_post_with_headers(
+            &self.client,
+            target_endpoint,
+            "/experimental/p2p_kv_transfer",
+            &payload,
+            Some(headers),
+            false,
+        );
+        let decision = decision.clone();
+        let attempt_id = lease.attempt_id.clone();
+
+        // The worker shields an admitted P2P operation until its data path has
+        // settled. Mirror that ownership here: dropping the downstream HTTP
+        // handler must not cancel the control request and release both node
+        // locks while the worker can still be ACTIVE. Tokio detaches a spawned
+        // task when its JoinHandle is dropped, so the task continues to own the
+        // request and lease through a client disconnect.
+        match tokio::spawn(async move {
+            Self::run_independent_p2p_transfer(request, decision, lease).await
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                error!(
+                    attempt_id,
+                    %error,
+                    "Independent P2P control settlement task failed; its lease was released defensively"
+                );
+                P2pTransferOutcome::TransportUncertain
+            }
+        }
+    }
+
+    async fn run_independent_p2p_transfer(
+        request: reqwest::RequestBuilder,
+        decision: RemoteKvDecision,
+        lease: P2pTransferLease,
+    ) -> P2pTransferOutcome {
+        info!(
+            attempt_id = %lease.attempt_id,
+            source = %decision.source_url,
+            target = %decision.target_url,
+            matched_tokens = decision.matched_tokens,
+            "Independent P2P transfer control request started"
+        );
+
+        let response = request.send().await;
+
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(
+                    attempt_id = %lease.attempt_id,
+                    source = %decision.source_url,
+                    target = %decision.target_url,
+                    matched_tokens = decision.matched_tokens,
+                    %error,
+                    "Independent P2P transport ended without a response; falling back to local recompute and relying on Worker single-flight/quarantine admission for any still-running transfer"
+                );
+                lease.release("p2p_control_transport_uncertain");
+                return P2pTransferOutcome::TransportUncertain;
+            }
+        };
+
+        let status = response.status();
+        let payload = match response.json::<Value>().await {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    attempt_id = %lease.attempt_id,
+                    source = %decision.source_url,
+                    target = %decision.target_url,
+                    matched_tokens = decision.matched_tokens,
+                    http_status = %status,
+                    %error,
+                    "Independent P2P control response was not valid JSON; falling back to local recompute"
+                );
+                lease.release("p2p_control_terminal_invalid_response");
+                return P2pTransferOutcome::Fallback;
+            }
+        };
+
+        let success = payload.get("success").and_then(Value::as_bool) == Some(true);
+        let fallback_recompute = payload
+            .get("fallback_recompute")
+            .and_then(Value::as_bool)
+            .unwrap_or(!success);
+        let transferred_tokens = payload
+            .get("transferred_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|tokens| usize::try_from(tokens).ok())
+            .unwrap_or_default();
+        let response_source_matches =
+            Self::p2p_response_endpoint_matches(&payload, "source_url", &decision.source_url);
+        let response_target_matches =
+            Self::p2p_response_endpoint_matches(&payload, "target_url", &decision.target_url);
+        let transferred_tokens_valid = transferred_tokens > 0
+            && transferred_tokens <= decision.matched_tokens
+            && transferred_tokens <= decision.token_ids.len();
+        let message = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("worker returned no message");
+
+        if status.is_success()
+            && success
+            && !fallback_recompute
+            && transferred_tokens_valid
+            && response_source_matches
+            && response_target_matches
+        {
+            info!(
+                attempt_id = %lease.attempt_id,
+                source = %decision.source_url,
+                target = %decision.target_url,
+                matched_tokens = decision.matched_tokens,
+                transferred_tokens,
+                "Independent P2P transfer control request completed successfully"
+            );
+            lease.release("p2p_control_terminal_success");
+            return P2pTransferOutcome::Transferred { transferred_tokens };
+        }
+
+        warn!(
+            attempt_id = %lease.attempt_id,
+            source = %decision.source_url,
+            target = %decision.target_url,
+            matched_tokens = decision.matched_tokens,
+            transferred_tokens,
+            http_status = %status,
+            success,
+            fallback_recompute,
+            transferred_tokens_valid,
+            response_source_matches,
+            response_target_matches,
+            message,
+            "Independent P2P transfer reached a terminal fallback; ordinary Prefill will recompute locally"
+        );
+        lease.release("p2p_control_terminal_fallback");
+        P2pTransferOutcome::Fallback
+    }
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -309,17 +897,26 @@ impl PDRouter {
         // Clone request once outside the retry loop, then use Arc to share across attempts
         // This avoids O(retries) clones by sharing the same data
         let shared_request = Arc::new(original_request.clone());
+        // Candidate selection, queueing, and stale-plan rejection do not count
+        // as a data-plane attempt. Once a real Worker control request is
+        // dispatched, later HTTP retries must use local recompute.
+        let p2p_dispatched = Arc::new(AtomicBool::new(false));
+        // This is one absolute budget for the entire logical request. Lock
+        // releases, replan ticks, and outer HTTP retries never extend it.
+        let p2p_admission_deadline = TokioInstant::now() + P2P_NODE_LOCK_ADMISSION_BUDGET;
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
                 move |attempt: u32| {
                     // Clone Arc (cheap reference count increment) instead of cloning the entire request
                     let shared_request = Arc::clone(&shared_request);
+                    let p2p_dispatched = Arc::clone(&p2p_dispatched);
                     let context = context.clone();
                     async move {
-                        let (prefill, decode) = match self
-                            .select_pd_pair(
+                        let selected = match self
+                            .select_pd_pair_with_decision(
                                 context.request_text.as_deref(),
+                                context.request_tokens.as_deref(),
                                 context.model_id,
                                 context.headers.as_ref(),
                             )
@@ -331,32 +928,295 @@ impl PDRouter {
                             }
                         };
 
+                        let mut prefill = selected.prefill;
+                        let mut decode = selected.decode;
+                        let mut p2p_decision = selected.remote_kv;
+                        let prepared_p2p_request = selected.prepared_p2p_request;
+                        if p2p_decision.is_some()
+                            && p2p_dispatched.load(Ordering::Acquire)
+                        {
+                            info!(
+                                attempt,
+                                "P2P already dispatched for this logical request; retrying with local recompute"
+                            );
+                            p2p_decision = None;
+                        }
+                        let mut admitted_node_lease = None;
+
+                        let base_json_request = match serde_json::to_value(shared_request.as_ref()) {
+                            Ok(v) => v,
+                            Err(e) => return Self::handle_serialization_error(e),
+                        };
+
+                        if p2p_decision.is_some() {
+                            if let Some(namespace_field) =
+                                Self::p2p_nonempty_cache_namespace(&base_json_request)
+                            {
+                                warn!(
+                                    namespace_field,
+                                    "P2P transfer skipped because the request uses a cache namespace or LoRA that the Router control payload cannot reproduce safely"
+                                );
+                                p2p_decision = None;
+                            }
+                        }
+
+                        if p2p_decision.is_some() {
+                            let request_tokens = match context.request_tokens.as_deref() {
+                                Some(tokens) => tokens,
+                                None => {
+                                    error!(
+                                        "P2P routing produced a decision without request tokens; \
+                                         forcing the fresh planner to stop and use local recompute"
+                                    );
+                                    &[]
+                                }
+                            };
+                            let p2p_lock_wait_started = Instant::now();
+                            info!(
+                                replan_interval_ms =
+                                    P2P_NODE_LOCK_REPLAN_INTERVAL.as_millis() as u64,
+                                admission_budget_ms =
+                                    P2P_NODE_LOCK_ADMISSION_BUDGET.as_millis() as u64,
+                                "Registered fair P2P waiter; replanning source and target until the absolute admission deadline"
+                            );
+
+                            if let Some(gate) = self.p2p_node_gate.as_ref() {
+                                loop {
+                                    match gate
+                                        .acquire_best_with(
+                                            p2p_admission_deadline,
+                                            || {
+                                                self.fresh_p2p_plan(
+                                                    request_tokens,
+                                                    prepared_p2p_request.as_ref(),
+                                                    context.model_id,
+                                                )
+                                            },
+                                            |expected_source, target| {
+                                                self.validate_granted_p2p_target(
+                                                    request_tokens,
+                                                    prepared_p2p_request.as_ref(),
+                                                    context.model_id,
+                                                    expected_source,
+                                                    target,
+                                                )
+                                            },
+                                        )
+                                        .await
+                                    {
+                                        P2pAdmissionResult::Granted {
+                                            context: fresh_decision,
+                                            target,
+                                            lease,
+                                        } => {
+                                            info!(
+                                                source = fresh_decision.source_url,
+                                                target = fresh_decision.target_url,
+                                                matched_tokens = fresh_decision.matched_tokens,
+                                                wait_ms = p2p_lock_wait_started
+                                                    .elapsed()
+                                                    .as_millis()
+                                                    as u64,
+                                                "Fair P2P admission atomically selected and locked the current lowest-load unlocked target"
+                                            );
+                                            prefill = target;
+                                            p2p_decision = Some(fresh_decision);
+                                            admitted_node_lease = Some(lease);
+
+                                            // Decode selection is refreshed after
+                                            // admission so a long queue wait does
+                                            // not freeze both halves of the route.
+                                            let refreshed = match self
+                                                .select_pd_pair_with_decision(
+                                                    context.request_text.as_deref(),
+                                                    None,
+                                                    context.model_id,
+                                                    context.headers.as_ref(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(pair) => pair,
+                                                Err(error) => {
+                                                    return Self::handle_server_selection_error(
+                                                        error,
+                                                    );
+                                                }
+                                            };
+                                            decode = refreshed.decode;
+                                            break;
+                                        }
+                                        P2pAdmissionResult::Stopped { reason, fallback } => {
+                                            info!(
+                                                reason,
+                                                wait_ms = p2p_lock_wait_started
+                                                    .elapsed()
+                                                    .as_millis()
+                                                    as u64,
+                                                "Fresh Router state no longer admits P2P; using a freshly selected local Prefill route"
+                                            );
+                                            let refreshed = match self
+                                                .select_pd_pair_with_decision(
+                                                    context.request_text.as_deref(),
+                                                    None,
+                                                    context.model_id,
+                                                    context.headers.as_ref(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(pair) => pair,
+                                                Err(error) => {
+                                                    return Self::handle_server_selection_error(
+                                                        error,
+                                                    );
+                                                }
+                                            };
+                                            prefill = fallback
+                                                .filter(|worker| worker.is_available())
+                                                .unwrap_or(refreshed.prefill);
+                                            decode = refreshed.decode;
+                                            p2p_decision = None;
+                                            break;
+                                        }
+                                        P2pAdmissionResult::TimedOut => {
+                                            warn!(
+                                                wait_ms = p2p_lock_wait_started
+                                                    .elapsed()
+                                                    .as_millis()
+                                                    as u64,
+                                                admission_budget_ms =
+                                                    P2P_NODE_LOCK_ADMISSION_BUDGET
+                                                        .as_millis()
+                                                        as u64,
+                                                "P2P fair admission budget exhausted; using a freshly selected local Prefill route"
+                                            );
+                                            let refreshed = match self
+                                                .select_pd_pair_with_decision(
+                                                    context.request_text.as_deref(),
+                                                    None,
+                                                    context.model_id,
+                                                    context.headers.as_ref(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(pair) => pair,
+                                                Err(error) => {
+                                                    return Self::handle_server_selection_error(
+                                                        error,
+                                                    );
+                                                }
+                                            };
+                                            prefill = refreshed.prefill;
+                                            decode = refreshed.decode;
+                                            p2p_decision = None;
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                error!(
+                                    "P2P routing produced a transfer without a node-lock gate; \
+                                     falling back to local recompute"
+                                );
+                                p2p_decision = None;
+                            }
+                        }
+
                         debug!(
-                            "PD retry attempt {} using prefill={} decode={}",
+                            "PD retry attempt {} using final prefill={} decode={}",
                             attempt,
                             prefill.url(),
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
-
-                        json_request = match Self::inject_bootstrap_into_value(
-                            json_request,
+                        // Bootstrap metadata and both normal payloads are built
+                        // only after admission settles, so a replanned Prefill
+                        // can never inherit the old target's bootstrap room.
+                        let json_request = match Self::inject_bootstrap_into_value(
+                            base_json_request,
                             prefill.as_ref(),
                             context.batch_size,
                         ) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
+                            Ok(value) => value,
+                            Err(error) => {
+                                return Self::handle_serialization_error(error);
+                            }
                         };
+                        let (prefill_json_request, decode_json_request) =
+                            match Self::prepare_pd_payloads(&json_request) {
+                                Ok(values) => values,
+                                Err(error) => {
+                                    return Self::handle_serialization_error(error);
+                                }
+                            };
+
+                        // Worker KV reservation begins only after this control
+                        // dispatch. Once dispatched, the lease remains owned by
+                        // the shielded settlement task through terminal state.
+                        if let (Some(decision), Some(node_lease)) =
+                            (p2p_decision.as_ref(), admitted_node_lease.take())
+                        {
+                            if p2p_dispatched
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_err()
+                            {
+                                info!(
+                                    attempt,
+                                    "Another retry already dispatched P2P; releasing the unused admission lease"
+                                );
+                                drop(node_lease);
+                            } else {
+                                let acquired_at = Instant::now();
+                                let attempt_id = format!("router-p2p-{}", Uuid::new_v4());
+                                let source = decision.source_url.as_str();
+                                let target = decision.target_url.as_str();
+                                let matched_tokens = decision.matched_tokens;
+                                let lease = P2pTransferLease {
+                                    _node_lease: node_lease,
+                                    explicitly_settled: false,
+                                    acquired_at,
+                                    source_url: source.to_string(),
+                                    target_url: target.to_string(),
+                                    matched_tokens,
+                                    attempt_id: attempt_id.clone(),
+                                };
+                                let mut p2p_headers = headers.cloned().unwrap_or_default();
+                                for key in Self::REMOTE_KV_HEADER_KEYS {
+                                    p2p_headers.remove(key);
+                                }
+                                inject_trace_context_http(&mut p2p_headers);
+                                info!(
+                                    attempt_id,
+                                    source,
+                                    target,
+                                    matched_tokens,
+                                    "Dispatching the admitted P2P control request"
+                                );
+                                let _ = self
+                                    .execute_independent_p2p_transfer(
+                                        &p2p_headers,
+                                        decision,
+                                        lease,
+                                    )
+                                    .await;
+                            }
+                        } else if admitted_node_lease.is_some() {
+                            error!(
+                                "P2P admission retained a node lease without a final decision; releasing it before local recompute"
+                            );
+                            drop(admitted_node_lease.take());
+                        }
 
                         let ctx_is_stream = context.is_stream;
                         let response = self
                             .execute_dual_dispatch_internal(
                                 headers,
-                                json_request,
+                                prefill_json_request,
+                                decode_json_request,
                                 context,
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
@@ -566,10 +1426,12 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
+    #[allow(clippy::too_many_arguments)]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
-        json_request: Value,
+        prefill_json_request: Value,
+        decode_json_request: Value,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
@@ -584,23 +1446,23 @@ impl PDRouter {
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
-        let headers = Some(&headers_with_trace);
+        let (prefill_headers, decode_headers) = Self::prepare_pd_headers(&headers_with_trace);
 
         // Build both requests
         let prefill_request = self.build_post_with_headers(
             &self.client,
             prefill.url(),
             context.route,
-            &json_request,
-            headers,
+            &prefill_json_request,
+            Some(&prefill_headers),
             false,
         );
         let decode_request = self.build_post_with_headers(
             &self.client,
             decode.url(),
             context.route,
-            &json_request,
-            headers,
+            &decode_json_request,
+            Some(&decode_headers),
             false,
         );
 
@@ -662,16 +1524,14 @@ impl PDRouter {
             prefill.record_outcome(prefill_ok);
 
             // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
-            let mut response = match self
-                .process_prefill_response(prefill_result, prefill.url(), false)
-                .await
-            {
-                Err(error_response) => error_response,
-                Ok(_) => error::bad_gateway(
-                    "prefill_server_error",
-                    "Prefill reported failure but returned a success response".to_string(),
-                ),
-            };
+            let mut response =
+                match Self::process_prefill_response(prefill_result, prefill.url(), false).await {
+                    Err(error_response) => error_response,
+                    Ok(_) => error::bad_gateway(
+                        "prefill_server_error",
+                        "Prefill reported failure but returned a success response".to_string(),
+                    ),
+                };
             response.extensions_mut().insert(BreakerOutcomesRecorded);
             return response;
         }
@@ -735,22 +1595,19 @@ impl PDRouter {
 
                 // Process prefill response
                 let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
+                    match Self::process_prefill_response(
+                        prefill_result,
+                        prefill.url(),
+                        context.return_logprob,
+                    )
+                    .await
                     {
                         Ok((_, body)) => body,
                         Err(error_response) => return error_response,
                     }
                 } else {
                     // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
+                    match Self::process_prefill_response(prefill_result, prefill.url(), false).await
                     {
                         Ok((_, body)) => body,
                         Err(error_response) => return error_response,
@@ -857,12 +1714,137 @@ impl PDRouter {
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
+    fn available_p2p_prefills(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
+        let effective_model_id = if !self.enable_igw { None } else { model_id };
+        let workers = if let Some(model) = effective_model_id {
+            self.worker_registry
+                .get_by_model(model)
+                .iter()
+                .filter(|worker| matches!(worker.worker_type(), WorkerType::Prefill { .. }))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            self.worker_registry.get_prefill_workers()
+        };
+        workers
+            .into_iter()
+            .filter(|worker| worker.is_available())
+            .collect()
+    }
+
+    fn fresh_p2p_plan(
+        &self,
+        request_tokens: &[u32],
+        prepared: Option<&P2pPreparedRequest>,
+        model_id: Option<&str>,
+    ) -> P2pFreshPlan<String> {
+        let Some(selector) = self.p2p_selector.as_ref() else {
+            return P2pFreshPlan::Stop {
+                reason: "p2p_selector_unavailable",
+                fallback: None,
+            };
+        };
+        let Some(prepared) = prepared else {
+            return P2pFreshPlan::Stop {
+                reason: "p2p_request_hashes_unavailable",
+                fallback: None,
+            };
+        };
+        let workers = self.available_p2p_prefills(model_id);
+        let Some(source_match) =
+            selector.match_source_prepared(&workers, request_tokens.len(), prepared)
+        else {
+            return P2pFreshPlan::Stop {
+                reason: "fresh_kv_owner_unavailable",
+                fallback: None,
+            };
+        };
+        let Some(source) = workers.get(source_match.source_index).cloned() else {
+            return P2pFreshPlan::Stop {
+                reason: "fresh_kv_owner_index_invalid",
+                fallback: None,
+            };
+        };
+        if source_match.source_bootstrap_addr.is_none() {
+            return P2pFreshPlan::Stop {
+                reason: "fresh_kv_owner_missing_bootstrap",
+                fallback: Some(source),
+            };
+        }
+
+        let candidates = workers
+            .into_iter()
+            .filter(|target| {
+                target.is_available() && selector.is_distinct_node(source.as_ref(), target.as_ref())
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return P2pFreshPlan::Stop {
+                reason: "fresh_p2p_target_unavailable",
+                fallback: Some(source),
+            };
+        }
+        if !candidates
+            .iter()
+            .any(|target| selector.pair_is_beneficial(source.as_ref(), target.as_ref()))
+        {
+            return P2pFreshPlan::Stop {
+                reason: "fresh_pair_no_longer_beneficial",
+                fallback: Some(source),
+            };
+        }
+
+        P2pFreshPlan::Candidate {
+            context: source.url().to_string(),
+            source,
+            candidates,
+        }
+    }
+
+    fn validate_granted_p2p_target(
+        &self,
+        request_tokens: &[u32],
+        prepared: Option<&P2pPreparedRequest>,
+        model_id: Option<&str>,
+        expected_source_url: &str,
+        target: &Arc<dyn Worker>,
+    ) -> Option<RemoteKvDecision> {
+        let selector = self.p2p_selector.as_ref()?;
+        let prepared = prepared?;
+        let workers = self.available_p2p_prefills(model_id);
+        let selection = selector.select_for_target_prepared(
+            &workers,
+            request_tokens,
+            prepared,
+            target.url(),
+        )?;
+        let decision = selection.remote_kv?;
+        let source_matches =
+            decision.source_url.trim_end_matches('/') == expected_source_url.trim_end_matches('/');
+        let target_matches =
+            decision.target_url.trim_end_matches('/') == target.url().trim_end_matches('/');
+        (source_matches && target_matches).then_some(decision)
+    }
+
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+        let selected = self
+            .select_pd_pair_with_decision(request_text, None, model_id, headers)
+            .await?;
+        Ok((selected.prefill, selected.decode))
+    }
+
+    async fn select_pd_pair_with_decision(
+        &self,
+        request_text: Option<&str>,
+        request_tokens: Option<&[u32]>,
+        model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+    ) -> Result<SelectedPdPair, String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         debug!(
@@ -900,15 +1882,54 @@ impl PDRouter {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
-            request_text,
-            headers,
-            hash_ring.clone(),
-            "prefill",
-        )
-        .await?;
+        let mut remote_kv = None;
+        let mut prepared_p2p_request = None;
+        let prefill =
+            if let (Some(selector), Some(tokens)) = (self.p2p_selector.as_ref(), request_tokens) {
+                let available_prefills: Vec<_> = prefill_workers
+                    .iter()
+                    .filter(|worker| worker.is_available())
+                    .cloned()
+                    .collect();
+                let prepared = selector.prepare_request(tokens);
+                let selection = prepared.as_ref().and_then(|prepared| {
+                    selector.select_prepared(&available_prefills, tokens, prepared)
+                });
+                prepared_p2p_request = prepared;
+                match selection {
+                    Some(selection) => {
+                        let selected = available_prefills
+                            .get(selection.target_index)
+                            .cloned()
+                            .ok_or_else(|| {
+                                "P2P selector returned an invalid Prefill index".to_string()
+                            })?;
+                        remote_kv = selection.remote_kv;
+                        selected
+                    }
+                    None => {
+                        Self::pick_worker_by_policy_arc(
+                            &prefill_workers,
+                            &*prefill_policy,
+                            request_text,
+                            headers,
+                            hash_ring.clone(),
+                            "prefill",
+                        )
+                        .await?
+                    }
+                }
+            } else {
+                Self::pick_worker_by_policy_arc(
+                    &prefill_workers,
+                    &*prefill_policy,
+                    request_text,
+                    headers,
+                    hash_ring.clone(),
+                    "prefill",
+                )
+                .await?
+            };
 
         let decode = Self::pick_worker_by_policy_arc(
             &decode_workers,
@@ -935,7 +1956,12 @@ impl PDRouter {
             decode_policy.name(),
         );
 
-        Ok((prefill, decode))
+        Ok(SelectedPdPair {
+            prefill,
+            decode,
+            remote_kv,
+            prepared_p2p_request,
+        })
     }
 
     async fn pick_worker_by_policy_arc(
@@ -1144,7 +2170,6 @@ impl PDRouter {
 
     // Helper to process prefill response and extract body if needed for logprobs
     async fn process_prefill_response(
-        &self,
         prefill_result: Result<reqwest::Response, reqwest::Error>,
         prefill_url: &str,
         return_logprob: bool,
@@ -1460,6 +2485,10 @@ impl RouterTrait for PDRouter {
         };
 
         let batch_size = Self::get_generate_batch_size(body);
+        let request_tokens = self
+            .p2p_selector
+            .as_ref()
+            .and_then(|_| self.p2p_tokens_for_generate(body, model_id));
 
         let context = PDRequestContext {
             route: "/generate",
@@ -1467,6 +2496,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            request_tokens,
             model_id,
             headers: headers.cloned(),
         };
@@ -1480,8 +2510,53 @@ impl RouterTrait for PDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        self.route_chat_with_input_ids(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_chat_with_input_ids(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        input_ids: Option<&InputIds>,
+    ) -> Response {
         let is_stream = body.stream;
         let return_logprob = body.logprobs;
+        let upstream_tokens = input_ids
+            .and_then(Self::p2p_tokens_from_input_ids)
+            .filter(|tokens| !tokens.is_empty());
+        let header_prompt_tokens = headers
+            .and_then(|headers| headers.get("x-sglang-prompt-tokens"))
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
+        let original_path = headers
+            .and_then(|headers| headers.get("x-envoy-original-path"))
+            .and_then(|value| value.to_str().ok());
+        if input_ids.is_some() && upstream_tokens.is_none() {
+            warn!(
+                ?header_prompt_tokens,
+                ?original_path,
+                "Invalid chat input_ids ignored for both P2P routing and backend forwarding"
+            );
+        } else if input_ids.is_none() && header_prompt_tokens.is_some() {
+            warn!(
+                ?header_prompt_tokens,
+                ?original_path,
+                "Pretokenized prompt length arrived without chat input_ids"
+            );
+        } else if let (Some(header_count), Some(tokens)) =
+            (header_prompt_tokens, upstream_tokens.as_ref())
+        {
+            if header_count != tokens.len() {
+                warn!(
+                    header_prompt_tokens = header_count,
+                    input_ids_count = tokens.len(),
+                    ?original_path,
+                    "Pretokenized prompt length does not match chat input_ids"
+                );
+            }
+        }
 
         let request_text = if self.policies_need_request_text() {
             body.messages.first().and_then(|msg| match msg {
@@ -1502,6 +2577,18 @@ impl RouterTrait for PDRouter {
 
         // Calculate batch size
         let batch_size = Self::get_chat_batch_size(body);
+        let request_tokens = if upstream_tokens.is_some() {
+            info!(
+                token_source = "upstream",
+                token_count = upstream_tokens.as_ref().map_or(0, Vec::len),
+                "P2P routing token source selected"
+            );
+            upstream_tokens.clone()
+        } else {
+            self.p2p_selector
+                .as_ref()
+                .and_then(|_| self.p2p_tokens_for_chat(body, model_id, None))
+        };
 
         let context = PDRequestContext {
             route: "/v1/chat/completions",
@@ -1509,11 +2596,17 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            request_tokens: request_tokens.clone(),
             model_id,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        let forwarded = ForwardedChatRequest {
+            request: body,
+            input_ids: request_tokens.as_deref(),
+        };
+        self.execute_dual_dispatch(headers, &forwarded, context)
+            .await
     }
 
     async fn route_completion(
@@ -1536,6 +2629,10 @@ impl RouterTrait for PDRouter {
 
         // Calculate batch size
         let batch_size = Self::get_completion_batch_size(body);
+        let request_tokens = self
+            .p2p_selector
+            .as_ref()
+            .and_then(|_| self.p2p_tokens_for_completion(body, model_id));
 
         let context = PDRequestContext {
             route: "/v1/completions",
@@ -1543,6 +2640,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            request_tokens,
             model_id,
             headers: headers.cloned(),
         };
@@ -1569,6 +2667,7 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
+            request_tokens: None,
             model_id,
             headers: headers.cloned(),
         };
@@ -1613,11 +2712,43 @@ impl RouterTrait for PDRouter {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+    use axum::{routing::post, Json, Router};
+    use tokio::net::TcpListener;
+
+    fn load_test_truncated_tokenizer() -> (tokenizers::Tokenizer, Option<usize>) {
+        let directory = tempfile::tempdir().unwrap();
+        let tokenizer_path = directory.path().join("tokenizer.json");
+        std::fs::write(
+            &tokenizer_path,
+            serde_json::to_vec(&json!({
+                "version": "1.0",
+                "truncation": {
+                    "direction": "Right",
+                    "max_length": 4,
+                    "strategy": "LongestFirst",
+                    "stride": 0
+                },
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": {"type": "Whitespace"},
+                "post_processor": null,
+                "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": {"[UNK]": 0, "x": 1},
+                    "unk_token": "[UNK]"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        PDRouter::load_p2p_untruncated_tokenizer(directory.path().to_str().unwrap()).unwrap()
+    }
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry =
-            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
         PDRouter {
             worker_registry,
@@ -1626,6 +2757,10 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
+            p2p_untruncated_tokenizer: None,
+            p2p_selector: None,
+            p2p_node_gate: None,
         }
     }
 
@@ -1635,6 +2770,369 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    fn test_p2p_decision(target_url: String) -> RemoteKvDecision {
+        RemoteKvDecision {
+            source_url: "http://source".to_string(),
+            source_bootstrap_addr: "source:8998".to_string(),
+            target_url,
+            matched_tokens: 3,
+            token_ids: vec![1, 2, 3],
+            reason: "load_imbalance",
+        }
+    }
+
+    async fn spawn_p2p_control_worker(response: Value) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/experimental/p2p_kv_transfer",
+            post(move |Json(_request): Json<Value>| {
+                let response = response.clone();
+                async move { Json(response) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    async fn spawn_blocked_p2p_control_worker(
+        response: Value,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/experimental/p2p_kv_transfer",
+            post(move |Json(_request): Json<Value>| {
+                let response = response.clone();
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Json(response)
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn abnormal_transfer_lease_drop_releases_only_its_nodes() {
+        let gate = P2pNodeGate::new_isolated(Duration::from_millis(20), 0);
+        let node_lease = gate
+            .acquire("http://worker-a", "http://worker-b")
+            .await
+            .expect("lease must enter");
+        let lease = P2pTransferLease {
+            _node_lease: node_lease,
+            explicitly_settled: false,
+            acquired_at: Instant::now(),
+            source_url: "http://worker-a".to_string(),
+            target_url: "http://worker-b".to_string(),
+            matched_tokens: 1,
+            attempt_id: "router-p2p-abnormal-drop".to_string(),
+        };
+
+        drop(lease);
+        assert!(
+            gate.acquire("http://worker-a", "http://worker-b")
+                .await
+                .is_some(),
+            "an abnormal Router task must not permanently blacklist either worker"
+        );
+    }
+
+    #[test]
+    fn independent_p2p_payload_is_not_forwarded_to_normal_pd() {
+        let decision = test_p2p_decision("http://target".to_string());
+        let control = PDRouter::p2p_transfer_payload(&decision, "router-p2p-123");
+        assert_eq!(control["source_url"], "http://source");
+        assert_eq!(control["target_url"], "http://target");
+        assert_eq!(control["source_bootstrap_addr"], "source:8998");
+        assert_eq!(control["matched_tokens"], 3);
+        assert_eq!(control["token_ids"], json!([1, 2, 3]));
+        assert_eq!(control["request_id"], "router-p2p-123");
+        assert_eq!(control["dry_run"], false);
+
+        let request = json!({
+            "model": "glm",
+            "prompt": "hello",
+            "remote_kv_source_url": "http://source",
+            "remote_kv_source_bootstrap_addr": "source:8998",
+            "remote_kv_target_url": "http://target",
+            "remote_kv_matched_tokens": 160_000,
+            "remote_kv_token_ids": [1, 2, 3],
+            "remote_kv_reason": "load_imbalance",
+            "remote_kv_attempt_id": "untrusted-inbound-attempt"
+        });
+        let (prefill, decode) = PDRouter::prepare_pd_payloads(&request).unwrap();
+
+        for payload in [&prefill, &decode] {
+            for key in PDRouter::REMOTE_KV_KEYS {
+                assert!(
+                    payload.get(key).is_none(),
+                    "fallback payload retained remote KV field {key}"
+                );
+            }
+            assert_eq!(payload["model"], "glm");
+            assert_eq!(payload["prompt"], "hello");
+        }
+
+        let mut inbound = HeaderMap::new();
+        inbound.insert("authorization", HeaderValue::from_static("Bearer test"));
+        inbound.insert(
+            "x-sgl-remote-kv-attempt-id",
+            HeaderValue::from_static("untrusted-inbound-attempt"),
+        );
+        let (prefill_headers, decode_headers) = PDRouter::prepare_pd_headers(&inbound);
+        for headers in [&prefill_headers, &decode_headers] {
+            for key in PDRouter::REMOTE_KV_HEADER_KEYS {
+                assert!(
+                    headers.get(key).is_none(),
+                    "normal PD headers retained remote KV hint {key}"
+                );
+            }
+            assert_eq!(headers.get("authorization").unwrap(), "Bearer test");
+        }
+    }
+
+    #[test]
+    fn namespaced_or_lora_requests_fail_closed_for_p2p() {
+        for key in PDRouter::P2P_CACHE_NAMESPACE_KEYS {
+            let request = Value::Object(serde_json::Map::from_iter([(
+                key.to_string(),
+                json!("non-empty"),
+            )]));
+            assert_eq!(
+                PDRouter::p2p_nonempty_cache_namespace(&request),
+                Some(key),
+                "{key} must disable P2P until the control payload reproduces its cache namespace"
+            );
+        }
+        assert_eq!(
+            PDRouter::p2p_nonempty_cache_namespace(&json!({
+                "extra_key": "",
+                "cache_salt": null,
+                "lora_id": "",
+                "lora_path": null,
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn p2p_response_endpoints_are_checked_when_worker_returns_them() {
+        assert!(PDRouter::p2p_response_endpoint_matches(
+            &json!({}),
+            "source_url",
+            "http://source"
+        ));
+        assert!(PDRouter::p2p_response_endpoint_matches(
+            &json!({"source_url": "http://source/"}),
+            "source_url",
+            "http://source"
+        ));
+        assert!(!PDRouter::p2p_response_endpoint_matches(
+            &json!({"source_url": "http://different"}),
+            "source_url",
+            "http://source"
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_p2p_control_releases_node_locks_before_normal_prefill() {
+        let (target_url, server) = spawn_p2p_control_worker(json!({
+            "success": true,
+            "message": "transferred",
+            "matched_tokens": 3,
+            "transferred_tokens": 3,
+            "fallback_recompute": false,
+        }))
+        .await;
+        let decision = test_p2p_decision(format!("{target_url}/"));
+        let gate = P2pNodeGate::new_isolated(Duration::from_millis(20), 0);
+        let node_lease = gate
+            .acquire(&decision.source_url, &decision.target_url)
+            .await
+            .expect("lease must enter");
+        let lease = P2pTransferLease {
+            _node_lease: node_lease,
+            explicitly_settled: false,
+            acquired_at: Instant::now(),
+            source_url: decision.source_url.clone(),
+            target_url: decision.target_url.clone(),
+            matched_tokens: decision.matched_tokens,
+            attempt_id: "router-p2p-terminal".to_string(),
+        };
+
+        let router = create_test_pd_router();
+        let outcome = router
+            .execute_independent_p2p_transfer(&HeaderMap::new(), &decision, lease)
+            .await;
+        assert_eq!(
+            outcome,
+            P2pTransferOutcome::Transferred {
+                transferred_tokens: 3
+            }
+        );
+        assert!(
+            gate.acquire(&decision.source_url, &decision.target_url)
+                .await
+                .is_some(),
+            "normal Prefill must start after both P2P node locks are released"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelling_handler_does_not_drop_active_p2p_node_locks() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (target_url, server) = spawn_blocked_p2p_control_worker(
+            json!({
+                "success": true,
+                "message": "transferred",
+                "matched_tokens": 3,
+                "transferred_tokens": 3,
+                "fallback_recompute": false,
+            }),
+            Arc::clone(&started),
+            Arc::clone(&release),
+        )
+        .await;
+        let decision = test_p2p_decision(target_url);
+        let gate = P2pNodeGate::new_isolated(Duration::from_millis(20), 0);
+        let node_lease = gate
+            .acquire(&decision.source_url, &decision.target_url)
+            .await
+            .expect("lease must enter");
+        let lease = P2pTransferLease {
+            _node_lease: node_lease,
+            explicitly_settled: false,
+            acquired_at: Instant::now(),
+            source_url: decision.source_url.clone(),
+            target_url: decision.target_url.clone(),
+            matched_tokens: decision.matched_tokens,
+            attempt_id: "router-p2p-cancelled-handler".to_string(),
+        };
+
+        let router = Arc::new(create_test_pd_router());
+        let control_task = tokio::spawn({
+            let router = Arc::clone(&router);
+            let decision = decision.clone();
+            async move {
+                router
+                    .execute_independent_p2p_transfer(&HeaderMap::new(), &decision, lease)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("control request must reach the worker");
+
+        control_task.abort();
+        assert!(control_task.await.unwrap_err().is_cancelled());
+        assert!(
+            gate.acquire(&decision.source_url, &decision.target_url)
+                .await
+                .is_none(),
+            "detached control settlement must retain both locks after handler cancellation"
+        );
+
+        release.notify_waiters();
+        let reacquired = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(lease) = gate
+                    .acquire(&decision.source_url, &decision.target_url)
+                    .await
+                {
+                    break lease;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached settlement must eventually release both locks");
+        drop(reacquired);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_p2p_success_claim_falls_back_and_releases_node_locks() {
+        let (target_url, server) = spawn_p2p_control_worker(json!({
+            "success": true,
+            "message": "invalid oversized transfer",
+            "source_url": "http://source",
+            "matched_tokens": 3,
+            "transferred_tokens": 4,
+            "fallback_recompute": false,
+        }))
+        .await;
+        let decision = test_p2p_decision(target_url);
+        let gate = P2pNodeGate::new_isolated(Duration::from_millis(20), 0);
+        let node_lease = gate
+            .acquire(&decision.source_url, &decision.target_url)
+            .await
+            .expect("lease must enter");
+        let lease = P2pTransferLease {
+            _node_lease: node_lease,
+            explicitly_settled: false,
+            acquired_at: Instant::now(),
+            source_url: decision.source_url.clone(),
+            target_url: decision.target_url.clone(),
+            matched_tokens: decision.matched_tokens,
+            attempt_id: "router-p2p-invalid-success".to_string(),
+        };
+
+        let outcome = create_test_pd_router()
+            .execute_independent_p2p_transfer(&HeaderMap::new(), &decision, lease)
+            .await;
+        assert_eq!(outcome, P2pTransferOutcome::Fallback);
+        assert!(gate
+            .acquire(&decision.source_url, &decision.target_url)
+            .await
+            .is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn uncertain_p2p_transport_releases_router_locks_for_local_recompute() {
+        let decision = test_p2p_decision("not a valid worker URL".to_string());
+        let gate = P2pNodeGate::new_isolated(Duration::from_millis(20), 0);
+        let node_lease = gate
+            .acquire(&decision.source_url, &decision.target_url)
+            .await
+            .expect("lease must enter");
+        let lease = P2pTransferLease {
+            _node_lease: node_lease,
+            explicitly_settled: false,
+            acquired_at: Instant::now(),
+            source_url: decision.source_url.clone(),
+            target_url: decision.target_url.clone(),
+            matched_tokens: decision.matched_tokens,
+            attempt_id: "router-p2p-uncertain".to_string(),
+        };
+
+        let router = create_test_pd_router();
+        let outcome = router
+            .execute_independent_p2p_transfer(&HeaderMap::new(), &decision, lease)
+            .await;
+        assert_eq!(outcome, P2pTransferOutcome::TransportUncertain);
+        assert!(
+            gate.acquire(&decision.source_url, &decision.target_url)
+                .await
+                .is_some(),
+            "Router locks must not become a permanent blacklist after an uncertain transport"
+        );
     }
 
     #[tokio::test]
@@ -1707,6 +3205,138 @@ mod tests {
 
         assert_eq!(prefill_worker.load(), 0);
         assert_eq!(decode_worker.load(), 0);
+    }
+
+    #[test]
+    fn upstream_chat_input_ids_bypass_local_tokenizer() {
+        let router = create_test_pd_router();
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "glm",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .unwrap();
+        let ids = InputIds::Single((0..40_001).map(|id| id % 128_000).collect());
+        let normalized_ids =
+            PDRouter::p2p_tokens_from_input_ids(&ids).expect("flat IDs should normalize");
+
+        let tokens = router
+            .p2p_tokens_for_chat(&request, Some("glm"), Some(&normalized_ids))
+            .expect("valid upstream input_ids should not need a local tokenizer");
+
+        assert_eq!(tokens.len(), 40_001);
+        assert_eq!(tokens[0], 0);
+        assert_eq!(tokens[40_000], 40_000);
+    }
+
+    #[test]
+    fn upstream_chat_input_ids_are_forwarded_without_truncation() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "glm",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+        }))
+        .unwrap();
+        let ids = InputIds::Single((0..100_001).map(|id| id % 128_000).collect());
+        let normalized_ids =
+            PDRouter::p2p_tokens_from_input_ids(&ids).expect("flat IDs should normalize");
+        let forwarded = ForwardedChatRequest {
+            request: &request,
+            input_ids: Some(&normalized_ids),
+        };
+
+        let value = serde_json::to_value(forwarded).unwrap();
+        assert_eq!(value["input_ids"].as_array().map(Vec::len), Some(100_001));
+        assert_eq!(value["input_ids"][100_000], 100_000);
+        assert_eq!(
+            value["messages"],
+            json!([{"role": "user", "content": "hello"}])
+        );
+        assert_eq!(value["stream"], true);
+    }
+
+    #[test]
+    fn p2p_tokenizer_disables_embedded_truncation() {
+        let (tokenizer, previous_max_length) = load_test_truncated_tokenizer();
+        assert_eq!(previous_max_length, Some(4));
+        assert!(tokenizer.get_truncation().is_none());
+        assert_eq!(
+            tokenizer.encode("x ".repeat(100), false).unwrap().len(),
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn igw_matches_untruncated_tokenizer_by_registered_source() {
+        use crate::tokenizer::{MockTokenizer, TokenizerTrait};
+
+        let mut router = create_test_pd_router();
+        router.enable_igw = true;
+        router
+            .tokenizer_registry
+            .load("glm-tokenizer", "glm-served", "/models/glm", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn TokenizerTrait>)
+            })
+            .await
+            .unwrap();
+        router
+            .tokenizer_registry
+            .load(
+                "other-tokenizer",
+                "other-served",
+                "/models/other",
+                || async { Ok(Arc::new(MockTokenizer::default()) as Arc<dyn TokenizerTrait>) },
+            )
+            .await
+            .unwrap();
+        let (tokenizer, _) = load_test_truncated_tokenizer();
+        router.p2p_untruncated_tokenizer = Some(P2pUntruncatedTokenizer {
+            source: "/models/glm".to_string(),
+            tokenizer: Arc::new(tokenizer),
+        });
+
+        assert!(router
+            .p2p_untruncated_tokenizer_for_model("glm-served")
+            .is_some());
+        assert!(router
+            .p2p_untruncated_tokenizer_for_model("other-served")
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_chat_input_ids_fall_back_to_local_tokenizer() {
+        let router = create_test_pd_router();
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "glm",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .unwrap();
+
+        let negative = InputIds::Single(vec![1, -1, 2]);
+        assert!(router
+            .p2p_tokens_for_chat(
+                &request,
+                Some("glm"),
+                PDRouter::p2p_tokens_from_input_ids(&negative).as_deref(),
+            )
+            .is_none());
+
+        let singleton_batch = InputIds::Batch(vec![vec![1, 2, 3]]);
+        let singleton_tokens = PDRouter::p2p_tokens_from_input_ids(&singleton_batch).unwrap();
+        assert_eq!(
+            router
+                .p2p_tokens_for_chat(&request, Some("glm"), Some(&singleton_tokens))
+                .unwrap(),
+            vec![1, 2, 3]
+        );
+
+        let batch = InputIds::Batch(vec![vec![1, 2], vec![3, 4]]);
+        assert!(router
+            .p2p_tokens_for_chat(
+                &request,
+                Some("glm"),
+                PDRouter::p2p_tokens_from_input_ids(&batch).as_deref(),
+            )
+            .is_none());
     }
 
     #[tokio::test]

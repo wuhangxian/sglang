@@ -21,6 +21,7 @@ use smg_mesh::{
 };
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
+use validator::Validate;
 use wfaas::LoggingSubscriber;
 
 use crate::{
@@ -42,6 +43,7 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
+        common::InputIds,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -49,7 +51,7 @@ use crate::{
         rerank::V1RerankReqInput,
         responses::{ResponsesGetParams, ResponsesRequest},
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-        validated::ValidatedJson,
+        validated::{Normalizable, ValidatedJson},
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
@@ -75,6 +77,38 @@ pub struct AppState {
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_sync_manager: Option<Arc<MeshSyncManager>>,
+}
+
+/// Chat request plus the pre-tokenized prompt supplied by the upstream
+/// gateway. `openai-protocol` 1.0 does not model `input_ids` on
+/// `ChatCompletionRequest`, so it is extracted separately, used for P2P
+/// routing, and reattached to both model-backend requests.
+#[derive(Debug, Deserialize, Validate)]
+struct ChatCompletionRequestEnvelope {
+    #[serde(flatten)]
+    #[validate(nested)]
+    request: ChatCompletionRequest,
+    #[serde(default)]
+    input_ids: Option<Value>,
+}
+
+impl Normalizable for ChatCompletionRequestEnvelope {
+    fn normalize(&mut self) {
+        self.request.normalize();
+    }
+}
+
+fn parse_chat_input_ids(input_ids: Option<Value>) -> Option<InputIds> {
+    input_ids.and_then(|value| match serde_json::from_value::<InputIds>(value) {
+        Ok(input_ids) => Some(input_ids),
+        Err(error) => {
+            debug!(
+                %error,
+                "Ignoring malformed upstream chat input_ids; using local tokenizer fallback"
+            );
+            None
+        }
+    })
 }
 
 async fn parse_function_call(
@@ -184,11 +218,18 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedJson(payload): ValidatedJson<ChatCompletionRequestEnvelope>,
 ) -> Response {
+    let ChatCompletionRequestEnvelope { request, input_ids } = payload;
+    let input_ids = parse_chat_input_ids(input_ids);
     state
         .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
+        .route_chat_with_input_ids(
+            Some(&headers),
+            &request,
+            Some(&request.model),
+            input_ids.as_ref(),
+        )
         .await
 }
 
@@ -1147,4 +1188,60 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_envelope_preserves_long_input_ids_for_routing_and_forwarding() {
+        let input_ids: Vec<i32> = (0..40_001).map(|id| id % 128_000).collect();
+        let raw = json!({
+            "model": "glm",
+            "messages": [{"role": "user", "content": "hello"}],
+            "input_ids": input_ids,
+        });
+
+        let mut envelope: ChatCompletionRequestEnvelope =
+            serde_json::from_value(raw).expect("chat envelope should deserialize");
+        envelope.normalize();
+        envelope
+            .validate()
+            .expect("wrapped chat request should validate");
+
+        let input_ids = parse_chat_input_ids(envelope.input_ids.take());
+        match input_ids.as_ref() {
+            Some(InputIds::Single(ids)) => assert_eq!(ids.len(), 40_001),
+            other => panic!("expected single input_ids, got {other:?}"),
+        }
+
+        // The PD router's outbound wrapper owns the forwarding assertion.
+        // This layer must retain the full array without applying a length cap.
+    }
+
+    #[test]
+    fn chat_envelope_keeps_input_ids_optional() {
+        let raw = json!({
+            "model": "glm",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+
+        let envelope: ChatCompletionRequestEnvelope =
+            serde_json::from_value(raw).expect("chat envelope should deserialize");
+        assert!(envelope.input_ids.is_none());
+    }
+
+    #[test]
+    fn malformed_chat_input_ids_are_ignored() {
+        let raw = json!({
+            "model": "glm",
+            "messages": [{"role": "user", "content": "hello"}],
+            "input_ids": "not-an-array",
+        });
+
+        let envelope: ChatCompletionRequestEnvelope =
+            serde_json::from_value(raw).expect("malformed routing hint must not reject chat");
+        assert!(parse_chat_input_ids(envelope.input_ids).is_none());
+    }
 }

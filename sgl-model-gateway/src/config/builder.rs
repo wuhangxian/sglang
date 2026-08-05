@@ -491,6 +491,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn prefill_p2p_kv_transfer(mut self, enable: bool) -> Self {
+        self.config.enable_prefill_p2p_kv_transfer = enable;
+        self
+    }
+
     // ==================== Option Setters ====================
     // Accept Option<T> and only set if Some
 

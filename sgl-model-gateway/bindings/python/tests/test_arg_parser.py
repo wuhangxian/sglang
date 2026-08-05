@@ -25,6 +25,7 @@ class TestRouterArgs:
         assert args.policy == "cache_aware"
         assert args.worker_urls == []
         assert args.pd_disaggregation is False
+        assert args.enable_prefill_p2p_kv_transfer is False
         assert args.prefill_urls == []
         assert args.decode_urls == []
 
@@ -421,6 +422,14 @@ class TestPolicyFromStr:
 
 class TestParseRouterArgs:
     """Test the parse_router_args function."""
+
+    def test_parse_prefill_p2p_flag(self):
+        router_args = parse_router_args(
+            ["--pd-disaggregation", "--enable-prefill-p2p-kv-transfer"]
+        )
+
+        assert router_args.pd_disaggregation is True
+        assert router_args.enable_prefill_p2p_kv_transfer is True
 
     def test_parse_basic_args(self):
         """Test parsing basic router arguments."""

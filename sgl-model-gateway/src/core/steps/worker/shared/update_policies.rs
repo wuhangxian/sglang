@@ -8,7 +8,7 @@ use wfaas::{
     StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
-use crate::core::{steps::workflow_data::WorkerRegistrationData, Worker};
+use crate::core::{steps::workflow_data::WorkerRegistrationData, Worker, WorkerType};
 
 /// Unified step to update policy registry for registered workers.
 ///
@@ -106,6 +106,12 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
 
         for worker in workers.iter() {
             let model_id = worker.model_id().to_string();
+
+            if matches!(worker.worker_type(), WorkerType::Prefill { .. }) {
+                if let Some(index) = app_context.kv_event_index.as_ref() {
+                    index.add_worker(worker.url(), None).await;
+                }
+            }
 
             // Notify policy registry
             app_context

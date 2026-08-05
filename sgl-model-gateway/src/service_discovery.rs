@@ -982,6 +982,7 @@ mod tests {
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
             )),
+            kv_event_index: None,
             reasoning_parser_factory: None,
             tool_parser_factory: None,
             router_manager: None,

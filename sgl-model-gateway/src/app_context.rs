@@ -16,7 +16,7 @@ use crate::{
     core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
-    policies::PolicyRegistry,
+    policies::{KvEventIndex, PolicyRegistry},
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::router_manager::RouterManager,
     tokenizer::registry::TokenizerRegistry,
@@ -46,6 +46,7 @@ pub struct AppContext {
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
+    pub kv_event_index: Option<Arc<KvEventIndex>>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: Arc<dyn ResponseStorage>,
     pub conversation_storage: Arc<dyn ConversationStorage>,
@@ -78,6 +79,7 @@ pub struct AppContextBuilder {
     tool_parser_factory: Option<ToolParserFactory>,
     worker_registry: Option<Arc<WorkerRegistry>>,
     policy_registry: Option<Arc<PolicyRegistry>>,
+    kv_event_index: Option<Arc<KvEventIndex>>,
     router_manager: Option<Arc<RouterManager>>,
     response_storage: Option<Arc<dyn ResponseStorage>>,
     conversation_storage: Option<Arc<dyn ConversationStorage>>,
@@ -118,6 +120,7 @@ impl AppContextBuilder {
             tool_parser_factory: None,
             worker_registry: None,
             policy_registry: None,
+            kv_event_index: None,
             router_manager: None,
             response_storage: None,
             conversation_storage: None,
@@ -170,6 +173,11 @@ impl AppContextBuilder {
 
     pub fn policy_registry(mut self, policy_registry: Arc<PolicyRegistry>) -> Self {
         self.policy_registry = Some(policy_registry);
+        self
+    }
+
+    pub fn kv_event_index(mut self, kv_event_index: Option<Arc<KvEventIndex>>) -> Self {
+        self.kv_event_index = kv_event_index;
         self
     }
 
@@ -258,6 +266,7 @@ impl AppContextBuilder {
             policy_registry: self
                 .policy_registry
                 .ok_or(AppContextBuildError("policy_registry"))?,
+            kv_event_index: self.kv_event_index,
             router_manager: self.router_manager,
             response_storage: self
                 .response_storage
@@ -298,6 +307,11 @@ impl AppContextBuilder {
             .with_tool_parser_factory()
             .with_worker_registry()
             .with_policy_registry(&router_config)
+            .kv_event_index(
+                router_config
+                    .enable_prefill_p2p_kv_transfer
+                    .then(KvEventIndex::new),
+            )
             .with_storage(&router_config)?
             .with_load_monitor(&router_config)
             .with_worker_job_queue()

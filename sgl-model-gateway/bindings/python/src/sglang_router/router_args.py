@@ -45,6 +45,7 @@ class RouterArgs:
     mini_lb: bool = False
     test_external_dp_routing: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
+    enable_prefill_p2p_kv_transfer: bool = False
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
@@ -382,6 +383,11 @@ class RouterArgs:
             f"--{prefix}pd-disaggregation",
             action="store_true",
             help="Enable PD (Prefill-Decode) disaggregated mode",
+        )
+        pd_group.add_argument(
+            f"--{prefix}enable-prefill-p2p-kv-transfer",
+            action="store_true",
+            help="Enable experimental Prefill-to-Prefill KV transfer",
         )
         pd_group.add_argument(
             f"--{prefix}prefill",

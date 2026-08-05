@@ -38,6 +38,10 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
             let model_id = worker.model_id().to_string();
             let worker_url = worker.url();
 
+            if let Some(index) = app_context.kv_event_index.as_ref() {
+                index.remove_worker(worker_url).await;
+            }
+
             // Remove from cache-aware policy (model_policies; covers the regular Router)
             app_context
                 .policy_registry

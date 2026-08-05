@@ -199,6 +199,10 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
     pd_disaggregation: bool,
 
+    /// Enable conservative Prefill-to-Prefill KV transfer on cache-aware rebalance
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    enable_prefill_p2p_kv_transfer: bool,
+
     /// Decode server URLs (can be specified multiple times)
     #[arg(long, action = ArgAction::Append, help_heading = "PD Disaggregation")]
     decode: Vec<String>,
@@ -1070,6 +1074,7 @@ impl CliArgs {
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
             .igw(self.enable_igw)
+            .prefill_p2p_kv_transfer(self.enable_prefill_p2p_kv_transfer)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());
 
         builder.build()

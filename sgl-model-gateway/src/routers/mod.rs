@@ -13,6 +13,7 @@ use axum::{
 use crate::protocols::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
+    common::InputIds,
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
@@ -97,6 +98,19 @@ pub trait RouterTrait: Send + Sync + Debug {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response;
+
+    /// Route a chat request with optional prompt IDs supplied by an upstream
+    /// tokenizer. Routers that do not use token-level routing retain
+    /// the existing behavior through this default implementation.
+    async fn route_chat_with_input_ids(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        _input_ids: Option<&InputIds>,
+    ) -> Response {
+        self.route_chat(headers, body, model_id).await
+    }
 
     /// Route a completion request
     async fn route_completion(

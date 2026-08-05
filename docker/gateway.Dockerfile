@@ -53,7 +53,7 @@ COPY --from=local_src /src /opt/sglang
 WORKDIR /opt/sglang/sgl-model-gateway
 
 # install maturin and build the wheel with vendored OpenSSL
-RUN uv pip install maturin \
+RUN uv pip install "maturin<1.14" \
     && cargo clean \
     && rm -rf bindings/python/dist/ \
     && cd bindings/python \

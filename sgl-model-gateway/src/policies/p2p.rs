@@ -5,6 +5,8 @@ use super::kv_events::{
 };
 use crate::core::Worker;
 
+pub const DEFAULT_BOOTSTRAP_PORT: u16 = 8998;
+
 #[derive(Debug, Clone, Copy)]
 pub struct P2pRoutingConfig {
     pub cache_threshold: f32,
@@ -45,8 +47,9 @@ pub struct P2pPreparedRequest {
 /// Conservative Prefill-to-Prefill selector layered on top of the legacy
 /// cache-aware policy. It only requests a transfer when a real KV-event hit
 /// exists and load thresholds independently require moving away from that
-/// cache owner. Missing metadata always returns `None` so the caller can use
-/// the legacy policy unchanged.
+/// cache owner. Missing routing metadata returns `None` so the caller can use
+/// the legacy policy unchanged; a missing bootstrap port uses the SGLang
+/// default.
 #[derive(Debug)]
 pub struct P2pCacheAwareSelector {
     config: P2pRoutingConfig,
@@ -142,9 +145,10 @@ impl P2pCacheAwareSelector {
         Some(P2pSourceMatch {
             source_index: owner_index,
             matched_tokens,
-            source_bootstrap_addr: source
-                .bootstrap_port()
-                .and_then(|port| source_bootstrap_addr(source.url(), port)),
+            source_bootstrap_addr: source_bootstrap_addr(
+                source.url(),
+                source.bootstrap_port().unwrap_or(DEFAULT_BOOTSTRAP_PORT),
+            ),
         })
     }
 
@@ -362,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_source_bootstrap_port_routes_back_to_cache_owner() {
+    fn missing_source_bootstrap_port_falls_back_to_default_port() {
         let source_url = "http://10.0.0.1:30000";
         let target_url = "http://10.0.0.2:30000";
         let (selector, token_ids) = selector(source_url);
@@ -373,8 +377,9 @@ mod tests {
 
         let selection = selector.select(&workers, &token_ids).unwrap();
 
-        assert_eq!(selection.target_index, 0);
-        assert!(selection.remote_kv.is_none());
+        assert_eq!(selection.target_index, 1);
+        let remote = selection.remote_kv.unwrap();
+        assert_eq!(remote.source_bootstrap_addr, "10.0.0.1:8998");
     }
 
     #[test]

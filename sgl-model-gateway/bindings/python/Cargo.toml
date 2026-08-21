@@ -29,4 +29,4 @@ strip = true
 
 # Keep this patch here because maturin builds from bindings/python as its root.
 [patch.crates-io]
-arrayref = { git = "https://github.com/droundy/arrayref", rev = "f8d0299d863922db6c409d08098941e833b70d69" }
+arrayref = { path = "../../vendor/arrayref-0.3.9" }

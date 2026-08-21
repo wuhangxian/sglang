@@ -31,8 +31,8 @@ pub use factory::PolicyFactory;
 pub use kv_events::KvEventIndex;
 pub use manual::{ManualConfig, ManualPolicy};
 pub use p2p::{
-    P2pCacheAwareSelector, P2pPreparedRequest, P2pRoutingConfig, P2pSelection, P2pSourceMatch,
-    RemoteKvDecision,
+    DEFAULT_BOOTSTRAP_PORT, P2pCacheAwareSelector, P2pPreparedRequest, P2pRoutingConfig,
+    P2pSelection, P2pSourceMatch, RemoteKvDecision,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};

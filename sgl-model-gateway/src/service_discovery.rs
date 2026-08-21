@@ -26,6 +26,7 @@ use crate::{
     app_context::AppContext,
     core::Job,
     observability::metrics::{metrics_labels, Metrics},
+    policies::DEFAULT_BOOTSTRAP_PORT,
     protocols::worker_spec::WorkerConfigRequest,
 };
 
@@ -168,15 +169,19 @@ impl PodInfo {
         };
 
         let bootstrap_port = if matches!(pod_type, Some(PodType::Prefill)) {
-            if let Some(config) = config {
+            // The prefill side already binds SGLang's default
+            // disaggregation bootstrap port unless it was explicitly
+            // overridden. A missing or malformed annotation therefore falls
+            // back to that default instead of leaving the worker without a
+            // reachable bootstrap address.
+            let annotated = config.and_then(|config| {
                 pod.metadata
                     .annotations
                     .as_ref()
                     .and_then(|annotations| annotations.get(&config.bootstrap_port_annotation))
                     .and_then(|port_str| port_str.parse::<u16>().ok())
-            } else {
-                None
-            }
+            });
+            Some(annotated.unwrap_or(DEFAULT_BOOTSTRAP_PORT))
         } else {
             None
         };
@@ -1212,7 +1217,17 @@ mod tests {
     }
 
     #[test]
-    fn test_pod_info_from_pod_with_pd_config_invalid_bootstrap_port() {
+    fn test_pod_info_from_pod_with_pd_config_prefill_defaults_missing_bootstrap_port() {
+        let k8s_pod = create_pd_k8s_pod("prefill-pod", "10.0.0.1", "prefill", None);
+        let config = create_pd_config();
+
+        let pod_info = PodInfo::from_pod(&k8s_pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.pod_type, Some(PodType::Prefill));
+        assert_eq!(pod_info.bootstrap_port, Some(8998));
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_with_pd_config_invalid_bootstrap_port_defaults() {
         let mut pod = create_pd_k8s_pod("prefill-pod", "10.0.0.1", "prefill", None);
         pod.metadata.annotations.as_mut().unwrap().insert(
             "sglang.ai/bootstrap-port".to_string(),
@@ -1222,7 +1237,7 @@ mod tests {
 
         let pod_info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
         assert_eq!(pod_info.pod_type, Some(PodType::Prefill));
-        assert!(pod_info.bootstrap_port.is_none());
+        assert_eq!(pod_info.bootstrap_port, Some(8998));
     }
 
     #[test]

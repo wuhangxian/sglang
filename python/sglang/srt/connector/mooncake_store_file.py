@@ -20,20 +20,56 @@ DEFAULT_CONFIG_PATH = "~/.config/mooncake/weight_store.json"
 DEFAULT_METADATA_DIR = "/tmp/mooncake-sglang-models"
 WEIGHT_PATTERNS = ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf"]
 _CLIENT_COUNTER = itertools.count(1)
-SAFETENSORS_DTYPES = {
-    "BOOL": (torch.bool, 1),
-    "U8": (torch.uint8, 1),
-    "I8": (torch.int8, 1),
-    "I16": (torch.int16, 2),
-    "I32": (torch.int32, 4),
-    "I64": (torch.int64, 8),
-    "F8_E4M3": (torch.float8_e4m3fn, 1),
-    "F8_E5M2": (torch.float8_e5m2, 1),
-    "F16": (torch.float16, 2),
-    "BF16": (torch.bfloat16, 2),
-    "F32": (torch.float32, 4),
-    "F64": (torch.float64, 8),
+
+# Canonical safetensors dtype name -> torch dtype attribute name. This mirrors
+# the dtype enum in the safetensors Rust core, so any checkpoint the reference
+# `safetensors` library can load is representable here -- the connector must not
+# "pick" models by shipping a narrower hand-written whitelist than the format.
+# Entries whose torch dtype is unavailable in the running torch build are
+# skipped (not fatal at import); an unknown/unsupported dtype instead surfaces a
+# clear error at parse time. Element sizes are derived from torch itself rather
+# than hand-encoded. Sub-byte dtypes (e.g. F4) are intentionally excluded: their
+# storage is not a whole number of bytes per element and cannot be described by
+# this (dtype, element_size) model -- they need dedicated handling.
+_SAFETENSORS_DTYPE_ATTRS = {
+    "BOOL": "bool",
+    "U8": "uint8",
+    "I8": "int8",
+    "F8_E5M2": "float8_e5m2",
+    "F8_E4M3": "float8_e4m3fn",
+    "F8_E8M0": "float8_e8m0fnu",
+    "F8_E4M3FNUZ": "float8_e4m3fnuz",
+    "F8_E5M2FNUZ": "float8_e5m2fnuz",
+    "I16": "int16",
+    "U16": "uint16",
+    "F16": "float16",
+    "BF16": "bfloat16",
+    "I32": "int32",
+    "U32": "uint32",
+    "F32": "float32",
+    "F64": "float64",
+    "I64": "int64",
+    "U64": "uint64",
+    "C64": "complex64",
+    "C128": "complex128",
 }
+
+
+def _build_safetensors_dtypes() -> dict:
+    table = {}
+    for st_name, attr in _SAFETENSORS_DTYPE_ATTRS.items():
+        dtype = getattr(torch, attr, None)
+        if dtype is None:
+            continue
+        try:
+            element_size = torch.empty((), dtype=dtype).element_size()
+        except (RuntimeError, TypeError):
+            continue
+        table[st_name] = (dtype, element_size)
+    return table
+
+
+SAFETENSORS_DTYPES = _build_safetensors_dtypes()
 
 
 def _matches(path: str, patterns: Optional[list[str]]) -> bool:
@@ -258,7 +294,9 @@ class MooncakeStoreFileConnector(BaseFileConnector):
                 record.path,
                 record.size,
             )
-            reader = _SequentialChunkReader(self.store, record, self.file_chunk_size)
+            reader = _SequentialChunkReader(
+                self.store, record, self._record_chunk_size(record)
+            )
             header_size = struct.unpack("<Q", reader.read(0, 8))[0]
             if header_size > record.size - 8:
                 raise RuntimeError(
@@ -314,14 +352,22 @@ class MooncakeStoreFileConnector(BaseFileConnector):
             return False
 
     def _read_tensor_batch(self, reader, record, batch):
-        batch_size = sum(info["size"] for info in batch)
-        if batch_size == 0:
+        # Account for per-tensor element alignment padding when sizing the
+        # buffer: a tensor may be nudged forward to an element-aligned offset,
+        # so the coalesced layout can be larger than the sum of tensor sizes.
+        required_size = 0
+        for info in batch:
+            element_size = info["element_size"]
+            if element_size > 1 and required_size % element_size:
+                required_size += element_size - (required_size % element_size)
+            required_size += info["size"]
+        if required_size == 0:
             return [
                 (info["name"], torch.empty(info["shape"], dtype=info["dtype"]))
                 for info in batch
             ]
 
-        if not self._ensure_batch_buffer(batch_size):
+        if not self._ensure_batch_buffer(required_size):
             return [self._read_tensor_fallback(reader, record, info) for info in batch]
 
         slot = self._batch_buffer
@@ -332,10 +378,20 @@ class MooncakeStoreFileConnector(BaseFileConnector):
         sizes = []
         tensor_offset = 0
         for info in batch:
+            # Each tensor is later exposed via buffer[start:...].view(dtype),
+            # which requires the byte offset within the uint8 buffer to be a
+            # multiple of the tensor's element size. Pad the layout so every
+            # tensor begins on an element-aligned boundary; without this, a
+            # tensor following an odd-length one lands on an unaligned offset
+            # and view() raises.
+            element_size = info["element_size"]
+            if element_size > 1 and tensor_offset % element_size:
+                tensor_offset += element_size - (tensor_offset % element_size)
             fragments = self._range_fragments(
                 record,
                 info["offset"],
                 info["size"],
+                chunk_size=self._record_chunk_size(record),
                 destination_offset=tensor_offset,
             )
             for key, dst, src, fragment_size in zip(*fragments):
@@ -372,6 +428,15 @@ class MooncakeStoreFileConnector(BaseFileConnector):
                         f"get_into_ranges failed for {key}: "
                         f"expected {expected_sizes}, got {actual_sizes}"
                     )
+            # view()/reshape() belong inside the try: an unexpected alignment or
+            # shape mismatch here must fall back to the sequential path rather
+            # than abort weight loading.
+            tensors = []
+            for info in batch:
+                start = info["buffer_offset"]
+                raw = slot["buffer"][start : start + info["size"]]
+                tensor = raw.view(info["dtype"]).reshape(info["shape"])
+                tensors.append((info["name"], tensor))
         except Exception as error:
             self._range_read_disabled = True
             logger.warning(
@@ -382,12 +447,6 @@ class MooncakeStoreFileConnector(BaseFileConnector):
             )
             return [self._read_tensor_fallback(reader, record, info) for info in batch]
 
-        tensors = []
-        for info in batch:
-            start = info["buffer_offset"]
-            raw = slot["buffer"][start : start + info["size"]]
-            tensor = raw.view(info["dtype"]).reshape(info["shape"])
-            tensors.append((info["name"], tensor))
         return tensors
 
     def _ensure_batch_buffer(self, required_size: int) -> bool:
@@ -438,8 +497,32 @@ class MooncakeStoreFileConnector(BaseFileConnector):
         tensor = torch.frombuffer(payload, dtype=info["dtype"]).reshape(info["shape"])
         return info["name"], tensor
 
+    def _record_chunk_size(self, record) -> int:
+        """Return the chunk size to use for mapping file offsets to chunks.
+
+        The store records the exact chunk size each file was written with; per
+        the ModelFileRecord contract, readers MUST use that value rather than
+        their own configured chunk size, and a value of 0 means an
+        unknown/legacy layout the reader must not guess. We only tolerate a
+        missing/zero value for single-chunk files (where the whole file is one
+        chunk and no offset->chunk math is needed); a multi-chunk file with no
+        authoritative chunk size is refused.
+        """
+        chunk_size = getattr(record, "chunk_size", 0) or 0
+        if chunk_size > 0:
+            return chunk_size
+        if len(record.chunks) <= 1:
+            # Single chunk: the entire file lives in chunk 0, so any size >=
+            # record.size maps every offset to that one chunk.
+            return max(record.size, 1)
+        raise RuntimeError(
+            f"Mooncake record {record.path!r} has {len(record.chunks)} chunks but "
+            f"no authoritative chunk_size (got {getattr(record, 'chunk_size', None)!r}); "
+            f"refusing to guess a legacy chunk layout"
+        )
+
     def _range_fragments(
-        self, record, offset: int, size: int, destination_offset: int = 0
+        self, record, offset: int, size: int, chunk_size: int, destination_offset: int = 0
     ):
         keys = []
         dst_offsets = []
@@ -448,9 +531,9 @@ class MooncakeStoreFileConnector(BaseFileConnector):
         copied = 0
         while copied < size:
             absolute_offset = offset + copied
-            chunk_index = absolute_offset // self.file_chunk_size
-            source_offset = absolute_offset % self.file_chunk_size
-            fragment_size = min(size - copied, self.file_chunk_size - source_offset)
+            chunk_index = absolute_offset // chunk_size
+            source_offset = absolute_offset % chunk_size
+            fragment_size = min(size - copied, chunk_size - source_offset)
             keys.append(record.chunks[chunk_index])
             dst_offsets.append([destination_offset + copied])
             src_offsets.append([source_offset])
@@ -472,8 +555,15 @@ class MooncakeStoreFileConnector(BaseFileConnector):
         for name, metadata in self._tensor_records(header):
             dtype_name = metadata["dtype"]
             if dtype_name not in SAFETENSORS_DTYPES:
+                known = dtype_name in _SAFETENSORS_DTYPE_ATTRS
+                detail = (
+                    "it is a sub-byte dtype not supported by this connector, or "
+                    "the running torch build lacks it"
+                    if known
+                    else "it is not a recognized safetensors dtype"
+                )
                 raise ValueError(
-                    f"unsupported safetensors dtype {dtype_name!r} for {name}"
+                    f"unsupported safetensors dtype {dtype_name!r} for {name}: {detail}"
                 )
             dtype, element_size = SAFETENSORS_DTYPES[dtype_name]
             shape = tuple(metadata["shape"])
@@ -494,6 +584,7 @@ class MooncakeStoreFileConnector(BaseFileConnector):
                 {
                     "name": name,
                     "dtype": dtype,
+                    "element_size": element_size,
                     "shape": shape,
                     "offset": data_offset + start,
                     "size": tensor_size,

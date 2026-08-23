@@ -14,10 +14,14 @@ except ModuleNotFoundError:
 
 
 class _Record:
-    def __init__(self, path, size, chunks):
+    def __init__(self, path, size, chunks, chunk_size=0):
         self.path = path
         self.size = size
         self.chunks = chunks
+        # Mirror ModelFileRecord.chunk_size: the authoritative chunk size the
+        # file was written with. 0 means unknown/legacy. The connector must use
+        # this value (not its own config) to map offsets to chunks.
+        self.chunk_size = chunk_size
 
 
 class _Manifest:
@@ -185,6 +189,7 @@ class MooncakeStoreFileConnectorTest(unittest.TestCase):
                     "model-00001-of-00001.safetensors",
                     len(safetensors_payload),
                     weight_keys,
+                    chunk_size=chunk_size,
                 ),
             ],
         )
@@ -253,7 +258,7 @@ class MooncakeStoreFileConnectorTest(unittest.TestCase):
         _FakeStore.objects = dict(zip(chunk_keys, chunks))
         _FakeStore.manifest = _Manifest(
             "READY",
-            [_Record("model.safetensors", len(payload), chunk_keys)],
+            [_Record("model.safetensors", len(payload), chunk_keys, chunk_size=chunk_size)],
         )
 
         connector = create_remote_connector(
@@ -322,6 +327,174 @@ class MooncakeStoreFileConnectorTest(unittest.TestCase):
         self.assertEqual(
             connector.tensor_batch_device.index, torch.cuda.current_device()
         )
+        connector.close()
+
+    def _single_file_manifest(self, payload, chunk_size, config_chunk_size=None):
+        """Split payload into chunks and publish a one-file READY manifest.
+
+        config_chunk_size, when set, is written into the connector config as
+        file_chunk_size so tests can prove the connector uses the record's
+        chunk_size and not its own configured value.
+        """
+        chunks = [
+            payload[offset : offset + chunk_size]
+            for offset in range(0, len(payload), chunk_size)
+        ]
+        chunk_keys = [f"weight-chunk-{index}" for index in range(len(chunks))]
+        _FakeStore.objects = dict(zip(chunk_keys, chunks))
+        _FakeStore.manifest = _Manifest(
+            "READY",
+            [_Record("model.safetensors", len(payload), chunk_keys, chunk_size=chunk_size)],
+        )
+        config_path = self.tmp / "weight-store.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "local_hostname": "test-client:12346",
+                    "metadata_server": "http://127.0.0.1:8080/metadata",
+                    "global_segment_size": "0",
+                    "local_buffer_size": "64MB",
+                    "protocol": "tcp",
+                    "master_server_addr": "127.0.0.1:50051",
+                    "file_chunk_size": config_chunk_size
+                    if config_chunk_size is not None
+                    else chunk_size,
+                    "tensor_batch_buffer_size": "1KB",
+                }
+            )
+        )
+        return config_path
+
+    def test_loads_f8_e8m0_dtype(self):
+        # B1 regression: a dtype outside the old hand-written whitelist (F8_E8M0,
+        # used by DeepSeek-V4 MXFP scale blocks) must load without patching.
+        if torch is None or save is None:
+            self.skipTest("torch and safetensors are required")
+        dtype = getattr(torch, "float8_e8m0fnu", None)
+        if dtype is None:
+            self.skipTest("this torch build lacks float8_e8m0fnu")
+
+        from sglang.srt.connector import create_remote_connector
+
+        tensor = torch.arange(8, dtype=torch.float32).to(dtype)
+        payload = save({"scale.weight": tensor})
+        config_path = self._single_file_manifest(payload, chunk_size=32)
+
+        connector = create_remote_connector(
+            "mooncake://f8-test",
+            mooncake_weight_store_config=str(config_path),
+            materialize_dir=str(self.tmp / "metadata"),
+        )
+        loaded = dict(connector.weight_iterator())
+        self.assertIn("scale.weight", loaded)
+        self.assertEqual(loaded["scale.weight"].dtype, dtype)
+        self.assertTrue(
+            torch.equal(loaded["scale.weight"].float(), tensor.float())
+        )
+        connector.close()
+
+    def test_unaligned_mixed_dtype_batch(self):
+        # B2 regression: a 1-byte tensor of odd length followed by wider dtypes
+        # in the same batch forces element-aligned padding; the fast path must
+        # not raise on view() and must return correct values.
+        if torch is None or save is None:
+            self.skipTest("torch and safetensors are required")
+
+        from sglang.srt.connector import create_remote_connector
+
+        odd = torch.arange(3, dtype=torch.uint8)  # 3 bytes -> misaligns the next
+        f32 = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        bf16 = torch.arange(6, dtype=torch.float32).to(torch.bfloat16).reshape(3, 2)
+        # Names ordered so safetensors lays them out a/b/c by data_offsets.
+        payload = save({"a.odd": odd, "b.f32": f32, "c.bf16": bf16})
+        config_path = self._single_file_manifest(payload, chunk_size=1024)
+
+        connector = create_remote_connector(
+            "mooncake://align-test",
+            mooncake_weight_store_config=str(config_path),
+            materialize_dir=str(self.tmp / "metadata"),
+        )
+        loaded = dict(connector.weight_iterator())
+        # Single batched range read (no fallback triggered).
+        self.assertEqual(_FakeStore.range_calls, 1)
+        self.assertTrue(torch.equal(loaded["a.odd"], odd))
+        self.assertTrue(torch.equal(loaded["b.f32"], f32))
+        self.assertTrue(torch.equal(loaded["c.bf16"], bf16))
+        connector.close()
+
+    def test_uses_record_chunk_size(self):
+        # M1 regression: the record's chunk_size disagrees with the connector's
+        # configured file_chunk_size. Reading correctly proves the connector
+        # honors the record's authoritative value.
+        if torch is None or save is None:
+            self.skipTest("torch and safetensors are required")
+
+        from sglang.srt.connector import create_remote_connector
+
+        first = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+        second = torch.arange(64, 128, dtype=torch.float32).reshape(8, 8)
+        payload = save({"first.weight": first, "second.weight": second})
+        # Real chunk size 48; connector config claims a wrong 128. If the
+        # connector used its own value, offset->chunk math would read garbage.
+        config_path = self._single_file_manifest(
+            payload, chunk_size=48, config_chunk_size=128
+        )
+
+        connector = create_remote_connector(
+            "mooncake://chunksize-test",
+            mooncake_weight_store_config=str(config_path),
+            materialize_dir=str(self.tmp / "metadata"),
+        )
+        loaded = dict(connector.weight_iterator())
+        self.assertTrue(torch.equal(loaded["first.weight"], first))
+        self.assertTrue(torch.equal(loaded["second.weight"], second))
+        connector.close()
+
+    def test_refuses_legacy_zero_chunk_size(self):
+        # M1 contract: a multi-chunk record with no authoritative chunk_size
+        # must be refused rather than guessed.
+        if torch is None or save is None:
+            self.skipTest("torch and safetensors are required")
+
+        from sglang.srt.connector import create_remote_connector
+
+        tensor = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+        payload = save({"w.weight": tensor})
+        chunk_size = 32
+        chunks = [
+            payload[offset : offset + chunk_size]
+            for offset in range(0, len(payload), chunk_size)
+        ]
+        chunk_keys = [f"weight-chunk-{index}" for index in range(len(chunks))]
+        self.assertGreater(len(chunk_keys), 1)
+        _FakeStore.objects = dict(zip(chunk_keys, chunks))
+        # chunk_size left at the default 0 -> legacy/unknown.
+        _FakeStore.manifest = _Manifest(
+            "READY",
+            [_Record("model.safetensors", len(payload), chunk_keys)],
+        )
+        config_path = self.tmp / "weight-store.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "local_hostname": "test-client:12346",
+                    "metadata_server": "http://127.0.0.1:8080/metadata",
+                    "global_segment_size": "0",
+                    "local_buffer_size": "64MB",
+                    "protocol": "tcp",
+                    "master_server_addr": "127.0.0.1:50051",
+                    "file_chunk_size": 32,
+                }
+            )
+        )
+
+        connector = create_remote_connector(
+            "mooncake://legacy-test",
+            mooncake_weight_store_config=str(config_path),
+            materialize_dir=str(self.tmp / "metadata"),
+        )
+        with self.assertRaises(RuntimeError):
+            dict(connector.weight_iterator())
         connector.close()
 
 

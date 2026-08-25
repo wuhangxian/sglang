@@ -38,6 +38,7 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    kv_cache_dtype: Optional[str] = None
 
 
 @dataclass
@@ -388,6 +389,9 @@ class HiCacheFile(HiCacheStorage):
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        kv_cache_dtype = storage_config.kv_cache_dtype
+        if kv_cache_dtype is not None:
+            self.config_suffix += f"_dtype_{kv_cache_dtype}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
